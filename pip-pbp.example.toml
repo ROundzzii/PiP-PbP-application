@@ -1,0 +1,26 @@
+# Copiez ce fichier en `pip-pbp.toml` à côté de l'exécutable (ou dans le dossier
+# courant). Toutes les clés sont optionnelles ; les arguments en ligne de commande
+# ont priorité sur ce fichier.
+
+[send]            # PC dont on partage l'écran
+port = 47800
+monitor = 0       # voir `pip-pbp monitors`
+fps = 60
+bitrate_mbps = 20
+downscale = 0     # 0 = auto (4K -> 1080p), 1 = natif, 2 = moitié…
+show_cursor = true
+sharp_text = false  # true = texte plus net mais encodage ~3x plus lent
+
+[view]            # PC qui affiche la fenêtre PiP / PbP
+host = "192.168.1.10"
+port = 47800
+opacity = 1.0               # opacité normale
+hover_opacity = 0.3         # opacité quand la souris passe sur la fenêtre
+click_through_on_hover = true  # les clics traversent la fenêtre au survol (Alt = reprendre la main)
+always_on_top = true
+keep_aspect = true
+decorations = false
+width = 960
+height = 540
+layout = "pip"              # pip | pbp-left | pbp-right | free
+pip_scale = 0.3             # largeur du PiP en fraction de l'écran
