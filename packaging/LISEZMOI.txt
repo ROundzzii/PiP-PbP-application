@@ -1,30 +1,33 @@
 PiP-PbP — voir l'écran d'un autre PC dans une fenêtre flottante
 ================================================================
 
-Rien à installer : copiez ce dossier sur chacun des deux PC (clé USB, partage réseau…).
+Rien à installer : copiez pip-pbp.exe sur chacun des deux PC (clé USB, partage réseau…)
+et double-cliquez dessus pour ouvrir l'interface.
 Les deux PC doivent être sur le même réseau local (même box / même switch).
 Pas de compte, pas de code à partager comme AnyDesk : les PC se trouvent tout seuls.
 
 1) Sur le PC dont vous voulez VOIR l'écran (la source) :
-     double-cliquez sur  1-partager-cet-ecran.bat
+     onglet « Partager cet écran »  ->  Démarrer le partage
    La première fois, Windows demande l'autorisation du pare-feu :
    cochez « Réseaux privés » ET « Réseaux publics », puis Autoriser.
 
 2) Sur le PC qui AFFICHE la fenêtre (le viewer) :
-     double-cliquez sur  2-afficher-l-autre-ecran.bat
-   La fenêtre trouve la source automatiquement (quelques secondes).
-   Si elle ne la trouve pas, ouvrez une invite de commandes ici et tapez :
-     pip-pbp view 192.168.1.XX     (l'IP affichée par la source)
+     onglet « Connexions »  ->  Rechercher  ->  Afficher
+   « Enregistrer » garde la connexion pour la prochaine fois.
+   Si la recherche ne trouve rien, saisissez l'IP affichée sur la source
+   (onglet « Partager cet écran », rubrique « Adresses de ce PC »).
 
-Dans la fenêtre :
+Réglages (opacité au survol, disposition PiP/PbP, fps, débit, écran capturé…) :
+onglet « Réglages d'affichage » et « Partager cet écran ». Ils sont enregistrés
+automatiquement dans %APPDATA%\pip-pbp\pip-pbp.toml.
+
+Dans la fenêtre PiP :
   - souris dessus         -> transparente, les clics passent à travers
   - Alt maintenu          -> redevient normale (pour la déplacer / redimensionner)
   - molette               -> agrandir / réduire
   - double-clic ou F      -> plein écran
   - 1 / 2 / 3             -> coin (PiP) / moitié gauche / moitié droite (PbP)
   - flèches haut / bas    -> opacité au survol
-  - Ctrl+Q                -> quitter
+  - Ctrl+Q                -> fermer la fenêtre
 
-Réglages : modifiez pip-pbp.toml (opacité, fps, débit, écran capturé…).
-Plusieurs écrans sur la source : « pip-pbp monitors » les liste, puis
-mettez monitor = N dans pip-pbp.toml (section [send]).
+Fermer l'interface arrête aussi les fenêtres PiP et le partage lancés depuis elle.

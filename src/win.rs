@@ -2,6 +2,7 @@
 //! fenêtre (fenêtre « layered »), position du curseur, zone de travail de l'écran.
 
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
+use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -62,4 +63,15 @@ impl Hwnd {
 /// Touche Alt enfoncée (état global, même si la fenêtre n'a pas le focus).
 pub fn alt_down() -> bool {
     unsafe { GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000 != 0 }
+}
+
+/// Lancé par double-clic, Windows ouvre une console vide à côté de l'interface :
+/// on la ferme si elle n'appartient qu'à nous (pas si on a été lancé depuis un terminal).
+pub fn detach_own_console() {
+    unsafe {
+        let mut pids = [0u32; 2];
+        if GetConsoleProcessList(&mut pids) == 1 {
+            let _ = FreeConsole();
+        }
+    }
 }

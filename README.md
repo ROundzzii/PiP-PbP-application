@@ -58,6 +58,24 @@ le même `pip-pbp.exe` (autonome, sans DLL) sur chacun. Pas de compte ni de code
 partager comme avec AnyDesk : les deux PC doivent simplement être sur le même réseau
 local, et le viewer trouve la source tout seul (broadcast UDP).
 
+### Interface graphique
+
+Double-cliquer sur `pip-pbp.exe` (ou le lancer sans argument) ouvre l'interface :
+
+- **Connexions** : rechercher les sources du réseau, enregistrer des connexions
+  (nom, IP, port), les modifier / supprimer, connexion rapide par IP.
+- **Partager cet écran** : démarrer / arrêter le partage, choix de l'écran, fps,
+  débit, résolution, curseur ; affiche les adresses IP de ce PC.
+- **Réglages d'affichage** : opacité normale et au survol, clic à travers, premier
+  plan, ratio, disposition PiP / PbP au démarrage, taille.
+- **Sessions** : fenêtres PiP et partage en cours, avec leur journal et un bouton Arrêter.
+
+Les réglages et connexions sont enregistrés automatiquement dans
+`%APPDATA%\pip-pbp\pip-pbp.toml` (ou dans un `pip-pbp.toml` placé à côté de l'exe,
+pour un usage portable).
+
+### Ligne de commande
+
 Sur le PC dont on veut voir l'écran :
 
 ```bash
@@ -80,8 +98,8 @@ La première fois, Windows demande d'autoriser `pip-pbp.exe` dans le pare-feu **
 source** : cocher « Réseaux privés » et « Réseaux publics ». Le viewer se reconnecte
 tout seul si la source redémarre.
 
-Le dossier `packaging/` contient deux raccourcis `.bat` et un `LISEZMOI.txt` pour
-distribuer l'exe sans ligne de commande.
+Le dossier `packaging/` contient un `LISEZMOI.txt` à joindre à l'exe pour
+le distribuer.
 
 Autres commandes :
 

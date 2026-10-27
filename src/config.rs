@@ -5,19 +5,35 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use clap::Args;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PORT: u16 = 47800;
 pub const CONFIG_FILE_NAME: &str = "pip-pbp.toml";
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct FileConfig {
     pub send: SendConfig,
     pub view: ViewConfig,
+    /// Connexions enregistrées depuis l'interface.
+    pub connections: Vec<Connection>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Connection {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for Connection {
+    fn default() -> Self {
+        Self { name: String::new(), host: String::new(), port: DEFAULT_PORT }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SendConfig {
     /// Port TCP d'écoute.
@@ -43,7 +59,7 @@ impl Default for SendConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ViewConfig {
     /// Adresse IP ou nom du PC source (vide ou "auto" = détection automatique).
@@ -161,7 +177,7 @@ impl ViewConfig {
 
 pub fn load_file(explicit: Option<&Path>) -> anyhow::Result<FileConfig> {
     let path = match explicit {
-        Some(p) => Some(p.to_path_buf()),
+        Some(p) => Some(p.to_path_buf()).filter(|p| p.exists()),
         None => default_locations().into_iter().find(|p| p.exists()),
     };
     let Some(path) = path else { return Ok(FileConfig::default()) };
@@ -171,10 +187,28 @@ pub fn load_file(explicit: Option<&Path>) -> anyhow::Result<FileConfig> {
     Ok(cfg)
 }
 
+pub fn save_file(path: &Path, cfg: &FileConfig) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = toml::to_string_pretty(cfg)?;
+    std::fs::write(path, text).with_context(|| format!("écriture de {}", path.display()))
+}
+
+/// Fichier utilisé par l'interface : un `pip-pbp.toml` existant (mode portable),
+/// sinon `%APPDATA%\pip-pbp\pip-pbp.toml`.
+pub fn settings_path() -> PathBuf {
+    let locations = default_locations();
+    locations.iter().find(|p| p.exists()).or(locations.last()).cloned().unwrap_or_else(|| CONFIG_FILE_NAME.into())
+}
+
 fn default_locations() -> Vec<PathBuf> {
     let mut v = vec![PathBuf::from(CONFIG_FILE_NAME)];
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
         v.push(dir.join(CONFIG_FILE_NAME));
+    }
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        v.push(PathBuf::from(appdata).join("pip-pbp").join(CONFIG_FILE_NAME));
     }
     v
 }

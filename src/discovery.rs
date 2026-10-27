@@ -48,9 +48,20 @@ pub fn spawn_responder(port: u16) {
 
 /// Côté viewer : cherche une source pendant `timeout`. Renvoie son adresse et son nom.
 pub fn find_source(port: u16, timeout: Duration) -> Option<(IpAddr, String)> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    socket.set_broadcast(true).ok()?;
-    socket.set_read_timeout(Some(Duration::from_millis(250))).ok()?;
+    search(port, timeout, true).into_iter().next()
+}
+
+/// Liste toutes les sources qui répondent pendant `timeout`.
+pub fn find_sources(port: u16, timeout: Duration) -> Vec<(IpAddr, String)> {
+    search(port, timeout, false)
+}
+
+fn search(port: u16, timeout: Duration, first_only: bool) -> Vec<(IpAddr, String)> {
+    let mut found: Vec<(IpAddr, String)> = Vec::new();
+    let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else { return found };
+    if socket.set_broadcast(true).is_err() || socket.set_read_timeout(Some(Duration::from_millis(250))).is_err() {
+        return found;
+    }
 
     let mut targets: Vec<SocketAddr> = vec![(Ipv4Addr::BROADCAST, port).into()];
     for (_, _, broadcast) in local_ipv4() {
@@ -71,9 +82,15 @@ pub fn find_source(port: u16, timeout: Duration) -> Option<(IpAddr, String)> {
                 && buf[..n].starts_with(REPLY)
             {
                 let name = String::from_utf8_lossy(&buf[REPLY.len()..n]).into_owned();
-                return Some((from.ip(), name));
+                // Une même source répond sur chacune de ses cartes réseau : on garde la première.
+                if !found.iter().any(|(_, n)| *n == name) {
+                    found.push((from.ip(), name));
+                }
+                if first_only {
+                    return found;
+                }
             }
         }
     }
-    None
+    found
 }

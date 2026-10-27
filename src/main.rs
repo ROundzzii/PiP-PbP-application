@@ -3,10 +3,12 @@
 //!
 //! - `pip-pbp send` sur le PC dont on veut voir l'écran (capture + encodage H.264).
 //! - `pip-pbp view <ip>` sur le PC qui affiche la fenêtre PiP/PbP.
+//! - `pip-pbp` seul (ou double-clic) ouvre l'interface graphique.
 
 mod capture;
 mod config;
 mod discovery;
+mod gui;
 mod protocol;
 mod render;
 mod sender;
@@ -23,8 +25,9 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<std::path::PathBuf>,
 
+    /// Sans commande : ouvre l'interface graphique.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -41,8 +44,12 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let Some(command) = cli.command else {
+        win::detach_own_console();
+        return gui::run();
+    };
     let file = config::load_file(cli.config.as_deref())?;
-    match cli.command {
+    match command {
         Command::Send(args) => sender::run(file.send.merge(args)),
         Command::View(args) => viewer::run(file.view.merge(args)),
         Command::Bench(args) => sender::bench(file.send.merge(args)),
