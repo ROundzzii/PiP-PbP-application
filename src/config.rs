@@ -46,7 +46,7 @@ impl Default for SendConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ViewConfig {
-    /// Adresse IP ou nom du PC source.
+    /// Adresse IP ou nom du PC source (vide ou "auto" = détection automatique).
     pub host: String,
     pub port: u16,
     /// Opacité normale de la fenêtre (0.0 – 1.0).
@@ -111,7 +111,7 @@ pub struct SendArgs {
 
 #[derive(Debug, Args)]
 pub struct ViewArgs {
-    /// Adresse IP du PC source
+    /// Adresse IP du PC source (omise = détection automatique sur le réseau local)
     pub host: Option<String>,
     #[arg(short, long)]
     pub port: Option<u16>,

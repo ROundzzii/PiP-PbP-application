@@ -6,6 +6,7 @@
 
 mod capture;
 mod config;
+mod discovery;
 mod protocol;
 mod render;
 mod sender;

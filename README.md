@@ -53,20 +53,35 @@ L'exécutable unique `target/release/pip-pbp.exe` sert aux deux PC.
 
 ## Utilisation
 
+L'application tourne sur **les deux PC**, mais il n'y a rien à installer : on copie
+le même `pip-pbp.exe` (autonome, sans DLL) sur chacun. Pas de compte ni de code à
+partager comme avec AnyDesk : les deux PC doivent simplement être sur le même réseau
+local, et le viewer trouve la source tout seul (broadcast UDP).
+
 Sur le PC dont on veut voir l'écran :
 
 ```bash
 pip-pbp send
 ```
 
-Sur le PC qui affiche (remplacer par l'IP du PC source) :
+Sur le PC qui affiche :
+
+```bash
+pip-pbp view
+```
+
+Ou avec l'IP de la source, si la détection automatique est bloquée (réseaux séparés, VPN…) :
 
 ```bash
 pip-pbp view 192.168.1.10
 ```
 
-Autoriser `pip-pbp.exe` dans le pare-feu Windows du PC source (port TCP 47800).
-Le viewer se reconnecte tout seul si la source redémarre.
+La première fois, Windows demande d'autoriser `pip-pbp.exe` dans le pare-feu **du PC
+source** : cocher « Réseaux privés » et « Réseaux publics ». Le viewer se reconnecte
+tout seul si la source redémarre.
+
+Le dossier `packaging/` contient deux raccourcis `.bat` et un `LISEZMOI.txt` pour
+distribuer l'exe sans ligne de commande.
 
 Autres commandes :
 

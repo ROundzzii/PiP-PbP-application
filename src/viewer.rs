@@ -16,6 +16,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId, WindowLevel};
 
 use crate::config::ViewConfig;
+use crate::discovery;
 use crate::protocol::{self, MAGIC, MSG_VIDEO, REQ_KEYFRAME};
 use crate::render::{Frame, Renderer};
 use crate::win::{self, Hwnd};
@@ -35,9 +36,6 @@ enum UserEvent {
 type Slot = Arc<Mutex<Option<Frame>>>;
 
 pub fn run(cfg: ViewConfig) -> anyhow::Result<()> {
-    if cfg.host.is_empty() {
-        bail!("indiquez l'adresse du PC source : `pip-pbp view 192.168.1.10` (ou `host` dans pip-pbp.toml)");
-    }
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let slot: Slot = Arc::default();
     {
@@ -49,10 +47,25 @@ pub fn run(cfg: ViewConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `host` vide ou "auto" : la source est cherchée automatiquement sur le réseau local.
 fn network_loop(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>) {
+    let auto = host.is_empty() || host.eq_ignore_ascii_case("auto");
     loop {
+        let host = if auto {
+            let _ = proxy.send_event(UserEvent::Status("PiP – recherche d'une source sur le réseau…".into()));
+            eprintln!("Recherche d'une source pip-pbp sur le réseau local…");
+            match discovery::find_source(port, Duration::from_secs(3)) {
+                Some((ip, name)) => {
+                    eprintln!("Source trouvée : {name} ({ip})");
+                    ip.to_string()
+                }
+                None => continue,
+            }
+        } else {
+            host.to_string()
+        };
         let _ = proxy.send_event(UserEvent::Status(format!("Connexion à {host}:{port}…")));
-        match receive(host, port, slot, proxy) {
+        match receive(&host, port, slot, proxy) {
             Ok(()) => eprintln!("Connexion fermée par la source"),
             Err(e) => eprintln!("Connexion : {e:#}"),
         }

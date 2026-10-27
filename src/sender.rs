@@ -15,6 +15,7 @@ use openh264::encoder::{
 
 use crate::capture::{Capturer, FrameStatus};
 use crate::config::SendConfig;
+use crate::discovery;
 use crate::protocol::{self, MAGIC, MSG_VIDEO, REQ_KEYFRAME};
 use crate::yuv::I420;
 
@@ -24,7 +25,12 @@ const MAX_IN_FLIGHT: usize = 2;
 
 pub fn run(cfg: SendConfig) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", cfg.port)).with_context(|| format!("écoute sur le port {}", cfg.port))?;
-    eprintln!("En attente d'un viewer sur le port {} (Ctrl+C pour quitter)…", cfg.port);
+    discovery::spawn_responder(cfg.port);
+    eprintln!("En attente d'un viewer sur le port {} (Ctrl+C pour quitter).", cfg.port);
+    eprintln!("Sur l'autre PC, lancez `pip-pbp view` (détection automatique) ou :");
+    for (name, ip, _) in discovery::local_ipv4() {
+        eprintln!("    pip-pbp view {ip}    ({name})");
+    }
     let mut capturer = Capturer::new(cfg.monitor, cfg.show_cursor)?;
 
     for stream in listener.incoming() {

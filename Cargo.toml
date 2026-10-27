@@ -7,6 +7,7 @@ description = "Picture-in-Picture / Picture-by-Picture entre deux PC Windows, fa
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4", features = ["derive"] }
+if-addrs = "0.15"
 openh264 = "0.9"
 pollster = "1.0.1"
 serde = { version = "1.0.229", features = ["derive"] }

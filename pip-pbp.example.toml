@@ -12,7 +12,7 @@ show_cursor = true
 sharp_text = false  # true = texte plus net mais encodage ~3x plus lent
 
 [view]            # PC qui affiche la fenêtre PiP / PbP
-host = "192.168.1.10"
+host = ""                  # vide = détection automatique, sinon l IP de la source
 port = 47800
 opacity = 1.0               # opacité normale
 hover_opacity = 0.3         # opacité quand la souris passe sur la fenêtre
