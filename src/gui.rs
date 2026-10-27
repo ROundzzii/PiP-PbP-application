@@ -20,6 +20,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::capture;
 use crate::config::{self, Connection, FileConfig};
 use crate::discovery;
+use crate::win;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const MAX_LOG_LINES: usize = 300;
@@ -87,6 +88,10 @@ struct Gui {
     found: Vec<(IpAddr, String)>,
     searched: bool,
 
+    /// Résultat du bouton pare-feu (en cours tant que le récepteur existe).
+    firewall: Option<Receiver<Result<(), String>>>,
+    firewall_status: Option<Result<(), String>>,
+
     monitors: Vec<String>,
     local_ips: Vec<(String, String)>,
     sessions: Vec<Session>,
@@ -109,6 +114,8 @@ impl Gui {
             search: None,
             found: Vec::new(),
             searched: false,
+            firewall: None,
+            firewall_status: None,
             monitors: Vec::new(),
             local_ips: Vec::new(),
             sessions: Vec::new(),
@@ -192,6 +199,12 @@ impl Gui {
             {
                 s.exit = Some(if status.success() { "terminée".into() } else { format!("arrêtée ({status})") });
             }
+        }
+        if let Some(rx) = &self.firewall
+            && let Ok(result) = rx.try_recv()
+        {
+            self.firewall_status = Some(result);
+            self.firewall = None;
         }
         if let Some(rx) = &self.search
             && let Ok(found) = rx.try_recv()
@@ -353,8 +366,38 @@ impl Gui {
                 self.spawn(&ctx, Kind::Send, "Partage de cet écran".into(), &["send".into()]);
             }
         });
-        ui.add_space(4.0);
-        ui.label(RichText::new("La première fois, autorisez pip-pbp dans le pare-feu Windows (réseaux privés et publics).").weak());
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let busy = self.firewall.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new("🛡 Autoriser dans le pare-feu"))
+                .on_hover_text("Nécessaire une fois sur ce PC pour que les autres puissent s'y connecter (demande les droits administrateur)")
+                .clicked()
+            {
+                let (tx, rx) = mpsc::channel();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(win::allow_in_firewall().map_err(|e| format!("{e:#}")));
+                    ctx.request_repaint();
+                });
+                self.firewall = Some(rx);
+            }
+            match (&self.firewall, &self.firewall_status) {
+                (Some(_), _) => {
+                    ui.spinner();
+                    ui.label("Validez la demande Windows…");
+                }
+                (None, Some(Ok(()))) => {
+                    ui.label(RichText::new("✔ pip-pbp est autorisé dans le pare-feu").color(Color32::from_rgb(80, 200, 120)));
+                }
+                (None, Some(Err(e))) => {
+                    ui.label(RichText::new(format!("✖ {e}")).color(Color32::LIGHT_RED));
+                }
+                (None, None) => {
+                    ui.label(RichText::new("Si l'autre PC voit un écran noir, cliquez ici.").weak());
+                }
+            }
+        });
 
         ui.add_space(12.0);
         section(ui, "Adresses de ce PC");

@@ -75,3 +75,42 @@ pub fn detach_own_console() {
         }
     }
 }
+
+/// Autorise cet exécutable dans le pare-feu Windows (entrant, tous profils réseau).
+/// Supprime d'abord les règles existantes pour l'exe : quand on n'autorise que les
+/// « réseaux privés » dans l'invite de Windows, il ajoute des règles de BLOCAGE pour
+/// les réseaux publics, qui l'emportent sur toute autorisation.
+/// Demande l'élévation (UAC) et attend la fin ; renvoie une erreur si refusé ou échoué.
+pub fn allow_in_firewall() -> anyhow::Result<()> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::core::{HSTRING, w};
+
+    let exe = std::env::current_exe()?;
+    let exe = exe.display();
+    let params = HSTRING::from(format!(
+        "/c netsh advfirewall firewall delete rule name=all program=\"{exe}\" & \
+         netsh advfirewall firewall add rule name=\"PiP-PbP\" dir=in action=allow program=\"{exe}\" enable=yes profile=any"
+    ));
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        lpVerb: w!("runas"),
+        lpFile: w!("cmd.exe"),
+        lpParameters: windows::core::PCWSTR(params.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    unsafe {
+        ShellExecuteExW(&mut info).map_err(|_| anyhow::anyhow!("autorisation administrateur refusée"))?;
+        let mut code = 1u32;
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let _ = GetExitCodeProcess(info.hProcess, &mut code);
+        let _ = CloseHandle(info.hProcess);
+        if code != 0 {
+            anyhow::bail!("netsh a échoué (code {code})");
+        }
+    }
+    Ok(())
+}

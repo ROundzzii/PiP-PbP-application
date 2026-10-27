@@ -1,7 +1,7 @@
 //! Côté affichage : réception TCP -> décodage H.264 -> fenêtre PiP/PbP.
 
 use std::io::{BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -74,7 +74,7 @@ fn network_loop(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserE
 }
 
 fn receive(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>) -> anyhow::Result<()> {
-    let stream = TcpStream::connect((host, port))?;
+    let stream = connect(host, port)?;
     stream.set_nodelay(true)?;
     let mut requests = stream.try_clone()?;
     let mut reader = BufReader::with_capacity(1 << 20, stream);
@@ -114,6 +114,30 @@ fn receive(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>
             eprintln!("{:.0} img/s reçues | décodage {:.1} ms/img", stats.1 as f64 / dt, stats.2 / stats.1 as f64);
             stats = (Instant::now(), 0, 0.0);
         }
+    }
+}
+
+/// Connexion avec un délai court : sans réponse, c'est presque toujours le pare-feu
+/// de la source (Windows ne refuse pas la connexion, il l'ignore).
+fn connect(host: &str, port: u16) -> anyhow::Result<TcpStream> {
+    let addrs = (host, port).to_socket_addrs()?;
+    let mut last = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    match last {
+        Some(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => bail!(
+            "{host}:{port} ne répond pas. Sur le PC source : partage démarré ? \
+             Cliquez « Autoriser dans le pare-feu » (onglet Partager cet écran)."
+        ),
+        Some(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            bail!("{host} refuse la connexion : le partage n'est pas démarré sur ce PC (ou autre port).")
+        }
+        Some(e) => Err(e.into()),
+        None => bail!("adresse introuvable : {host}"),
     }
 }
 

@@ -8,8 +8,7 @@ Pas de compte, pas de code à partager comme AnyDesk : les PC se trouvent tout s
 
 1) Sur le PC dont vous voulez VOIR l'écran (la source) :
      onglet « Partager cet écran »  ->  Démarrer le partage
-   La première fois, Windows demande l'autorisation du pare-feu :
-   cochez « Réseaux privés » ET « Réseaux publics », puis Autoriser.
+   Puis cliquez « Autoriser dans le pare-feu » (une seule fois, demande les droits admin).
 
 2) Sur le PC qui AFFICHE la fenêtre (le viewer) :
      onglet « Connexions »  ->  Rechercher  ->  Afficher
