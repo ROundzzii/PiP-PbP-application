@@ -271,6 +271,13 @@ type KeySink = Box<dyn Fn(u16, bool) + Send>;
 static KEY_SINK: std::sync::Mutex<Option<KeySink>> = std::sync::Mutex::new(None);
 static KEY_HOOK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+static HOOK_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static HOOK_INJECTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Diagnostic : touches vues par le hook depuis le début du contrôle, dont simulées.
+pub fn keyboard_hook_stats() -> (u32, u32) {
+    (HOOK_SEEN.load(Ordering::Relaxed), HOOK_INJECTED.load(Ordering::Relaxed))
+}
 static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 
 /// Mode contrôle : intercepte TOUT le clavier avant Windows (touche Windows, Alt+Tab,
@@ -282,6 +289,8 @@ pub fn start_keyboard_capture(sink: KeySink) -> bool {
     *KEY_SINK.lock().unwrap() = Some(sink);
     CTRL_DOWN.store(false, Ordering::Relaxed);
     ALT_DOWN.store(false, Ordering::Relaxed);
+    HOOK_SEEN.store(0, Ordering::Relaxed);
+    HOOK_INJECTED.store(0, Ordering::Relaxed);
     if KEY_HOOK.load(Ordering::Relaxed) != 0 {
         return true;
     }
@@ -311,8 +320,13 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
     unsafe {
         if code >= 0 {
             let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            // Les touches simulées par un autre programme passent normalement.
-            if !k.flags.contains(LLKHF_INJECTED) {
+            HOOK_SEEN.fetch_add(1, Ordering::Relaxed);
+            // Les claviers « gaming » (logiciels de macros, etc.) réinjectent souvent les
+            // frappes : elles sont marquées simulées mais viennent bien de l'utilisateur.
+            if k.flags.contains(LLKHF_INJECTED) {
+                HOOK_INJECTED.fetch_add(1, Ordering::Relaxed);
+            }
+            {
                 let down = !k.flags.contains(LLKHF_UP);
                 let vk = k.vkCode as u16;
                 if vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0 || vk == VK_CONTROL.0 {

@@ -15,7 +15,7 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
-use winit::window::{CursorGrabMode, CursorIcon, Fullscreen, ResizeDirection, Window, WindowId, WindowLevel};
+use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Fullscreen, ResizeDirection, Window, WindowId, WindowLevel};
 
 use crate::config::ViewConfig;
 use crate::discovery;
@@ -252,6 +252,9 @@ struct App {
     buttons_down: HashSet<u8>,
     /// Le clavier est capturé par le hook bas niveau (touche Windows, Alt+Tab…).
     keyboard_hooked: bool,
+    /// Curseur transparent du mode contrôle. On ne passe pas par `set_cursor_visible(false)` :
+    /// winit verrouille alors le curseur sur un seul pixel au centre de la fenêtre.
+    blank_cursor: Option<CustomCursor>,
     /// Compteurs du mode contrôle (diagnostic) : mouvements, clics, touches envoyés.
     sent: (u32, u32, Arc<std::sync::atomic::AtomicU32>),
 }
@@ -266,6 +269,7 @@ impl App {
             keys_down: Arc::default(),
             buttons_down: HashSet::new(),
             keyboard_hooked: false,
+            blank_cursor: None,
             sent: (0, 0, Arc::default()),
             window: None,
             hwnd: None,
@@ -459,7 +463,9 @@ impl App {
         // La souris reste dans la fenêtre et le curseur local disparaît : on ne voit plus
         // que celui de l'autre PC, dans l'image.
         let _ = window.set_cursor_grab(CursorGrabMode::Confined);
-        window.set_cursor_visible(false);
+        if let Some(blank) = &self.blank_cursor {
+            window.set_cursor(blank.clone());
+        }
         // Tout le clavier part vers l'autre PC, y compris la touche Windows et Alt+Tab.
         let (link, keys_down, keys_sent) = (self.link.clone(), self.keys_down.clone(), self.sent.2.clone());
         self.keyboard_hooked = win::start_keyboard_capture(Box::new(move |sc, down| {
@@ -502,15 +508,18 @@ impl App {
         }
         if let Some(window) = &self.window {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
-            window.set_cursor_visible(true);
+            window.set_cursor(CursorIcon::Move);
         }
         self.hovered = false;
         self.apply_opacity();
+        let (seen, injected) = win::keyboard_hook_stats();
         eprintln!(
-            "Contrôle à distance : rendu ({} mouvements de souris, {} clics/molette, {} touches envoyés)",
+            "Contrôle à distance : rendu ({} mouvements de souris, {} clics/molette, {} touches envoyés ; hook clavier : {} touches vues dont {} simulées)",
             self.sent.0,
             self.sent.1,
-            self.sent.2.load(std::sync::atomic::Ordering::Relaxed)
+            self.sent.2.load(std::sync::atomic::Ordering::Relaxed),
+            seen,
+            injected
         );
         self.request_redraw();
     }
@@ -611,6 +620,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         self.hwnd = Hwnd::of(&*window);
+        self.blank_cursor = Some(event_loop.create_custom_cursor(
+            CustomCursor::from_rgba(vec![0u8; 4 * 4 * 4], 4, 4, 0, 0).expect("curseur transparent valide"),
+        ));
         if let Some(h) = self.hwnd {
             h.follow_suggested_dpi_rect();
             if !h.register_control_hotkey() {
