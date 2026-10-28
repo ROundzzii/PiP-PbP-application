@@ -33,6 +33,8 @@ pub struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
+    /// Cadre orange du mode contrôle (couleur unie).
+    border_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     planes: Option<Planes>,
@@ -64,6 +66,20 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let v = textureSample(tv, s, in.uv).r - 0.5;
     let rgb = vec3<f32>(y + 1.596027 * v, y - 0.391762 * u - 0.812968 * v, y + 2.017232 * u);
     return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+"#;
+
+/// Couleur unie (cadre du mode contrôle), dessinée avec le même triangle plein écran.
+const BORDER_SHADER: &str = r#"
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs() -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.45, 0.0, 1.0);
 }
 "#;
 
@@ -168,13 +184,43 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+        let border_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cadre"),
+            source: wgpu::ShaderSource::Wgsl(BORDER_SHADER.into()),
+        });
+        let border_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let border_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("cadre"),
+            layout: Some(&border_layout),
+            vertex: wgpu::VertexState {
+                module: &border_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &border_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(config.format.into())],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 
-        Ok(Self { surface, device, queue, config, pipeline, layout, sampler, planes: None })
+        Ok(Self { surface, device, queue, config, pipeline, border_pipeline, layout, sampler, planes: None })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -262,9 +308,9 @@ impl Renderer {
         Some((x + inset, y + inset, w, h))
     }
 
-    /// `border` : couleur du liseré affiché autour de l'image (mode contrôle).
-    pub fn render(&mut self, keep_aspect: bool, border: Option<wgpu::Color>) {
-        let inset = if border.is_some() { BORDER_WIDTH } else { 0.0 };
+    /// `border` : cadre orange de même épaisseur sur les 4 bords de la fenêtre (mode contrôle).
+    pub fn render(&mut self, keep_aspect: bool, border: bool) {
+        let inset = if border { BORDER_WIDTH } else { 0.0 };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -283,7 +329,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(border.unwrap_or(wgpu::Color::BLACK)),
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -297,6 +343,17 @@ impl Renderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &p.bind_group, &[]);
                 pass.draw(0..3, 0..1);
+            }
+            if border {
+                let (w, h, b) = (self.config.width as f32, self.config.height as f32, BORDER_WIDTH);
+                pass.set_pipeline(&self.border_pipeline);
+                // Haut, bas, gauche, droite.
+                for (x, y, sw, sh) in [(0.0, 0.0, w, b), (0.0, h - b, w, b), (0.0, b, b, h - 2.0 * b), (w - b, b, b, h - 2.0 * b)] {
+                    if sw >= 1.0 && sh >= 1.0 {
+                        pass.set_viewport(x, y, sw, sh, 0.0, 1.0);
+                        pass.draw(0..3, 0..1);
+                    }
+                }
             }
         }
         self.queue.submit([encoder.finish()]);

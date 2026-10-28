@@ -145,6 +145,22 @@ unsafe extern "system" fn dpi_subclass_proc(
     _data: usize,
 ) -> LRESULT {
     unsafe {
+        if msg == WM_SIZING {
+            let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+            let aspect = f64::from_bits(RESIZE_ASPECT.load(Ordering::Relaxed));
+            if aspect > 0.0 {
+                let r = &mut *(lparam.0 as *mut RECT);
+                let (mut wr, mut cr) = (RECT::default(), RECT::default());
+                let _ = GetWindowRect(hwnd, &mut wr);
+                let _ = GetClientRect(hwnd, &mut cr);
+                // Épaisseur des bordures Windows (0 sans barre de titre).
+                let nc = ((wr.right - wr.left) - (cr.right - cr.left), (wr.bottom - wr.top) - (cr.bottom - cr.top));
+                let (l, t, rr, b) = constrain_sizing((r.left, r.top, r.right, r.bottom), wparam.0 as u32, aspect, nc);
+                *r = RECT { left: l, top: t, right: rr, bottom: b };
+                return LRESULT(1);
+            }
+            return result;
+        }
         if msg == WM_HOTKEY && wparam.0 as i32 == HOTKEY_CONTROL_ID {
             HOTKEY_PRESSED.store(true, Ordering::Relaxed);
             return LRESULT(0);
@@ -168,6 +184,53 @@ unsafe extern "system" fn dpi_subclass_proc(
 }
 
 const HOTKEY_CONTROL_ID: i32 = 0x5050;
+
+/// Ratio largeur / hauteur imposé pendant le redimensionnement à la souris (0 = libre).
+static RESIZE_ASPECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Redimensionnement proportionnel : en tirant un bord ou un coin, la fenêtre garde le
+/// format de l'image. `None` = étirement libre.
+pub fn set_resize_aspect(aspect: Option<f64>) {
+    RESIZE_ASPECT.store(aspect.filter(|a| a.is_finite() && *a > 0.0).unwrap_or(0.0).to_bits(), Ordering::Relaxed);
+}
+
+/// Ajuste le rectangle proposé par Windows pendant un redimensionnement (`WM_SIZING`)
+/// pour que la zone cliente garde le ratio `aspect`. `edge` = bord tiré (WMSZ_*),
+/// `nc` = bordures Windows (largeur, hauteur) à exclure du calcul.
+pub fn constrain_sizing(rect: (i32, i32, i32, i32), edge: u32, aspect: f64, nc: (i32, i32)) -> (i32, i32, i32, i32) {
+    const MIN_W: i32 = 160;
+    let (mut l, mut t, mut r, mut b) = rect;
+    let cw = ((r - l) - nc.0).max(MIN_W);
+    let ch = ((b - t) - nc.1).max(1);
+    let (left, right, top, bottom) = (1, 2, 3, 6);
+    match edge {
+        // Bord haut ou bas : la hauteur décide, la largeur suit (vers la droite).
+        e if e == top || e == bottom => {
+            let w = (ch as f64 * aspect).round() as i32;
+            r = l + w.max(MIN_W) + nc.0;
+        }
+        // Bord gauche/droit ou coin : la largeur décide, la hauteur suit.
+        _ => {
+            let h = (cw as f64 / aspect).round() as i32;
+            if edge == left || edge == right {
+                b = t + h + nc.1;
+            } else if edge == 4 || edge == 5 {
+                // Coins du haut : le bas reste fixe.
+                t = b - h - nc.1;
+            } else {
+                b = t + h + nc.1;
+            }
+            if cw == MIN_W {
+                if edge == left || edge == 4 || edge == 7 {
+                    l = r - MIN_W - nc.0;
+                } else {
+                    r = l + MIN_W + nc.0;
+                }
+            }
+        }
+    }
+    (l, t, r, b)
+}
 static HOTKEY_PRESSED: AtomicBool = AtomicBool::new(false);
 
 /// Renvoie `true` (une seule fois) si Ctrl+Alt+K a été pressé depuis le dernier appel.
@@ -386,6 +449,20 @@ mod tests {
 
     /// Vérifie que le hook clavier reçoit bien les touches. Simule F24 (touche absente
     /// des claviers, interceptée et bloquée par le hook). Lancer avec `--ignored`.
+    #[test]
+    fn sizing_keeps_aspect() {
+        let a = 16.0 / 9.0;
+        // Bord droit tiré à 1600 de large : la hauteur suit (900).
+        assert_eq!(constrain_sizing((0, 0, 1600, 300), 2, a, (0, 0)), (0, 0, 1600, 900));
+        // Bord bas tiré à 450 de haut : la largeur suit (800).
+        assert_eq!(constrain_sizing((100, 100, 300, 550), 6, a, (0, 0)), (100, 100, 900, 550));
+        // Coin haut-gauche : le bas-droit reste fixe, la hauteur suit la largeur.
+        assert_eq!(constrain_sizing((200, 0, 1000, 1000), 4, a, (0, 0)), (200, 550, 1000, 1000));
+        // Avec une barre de titre (16 x 39 px de bordures), seule la zone cliente compte.
+        let (l, t, r, b) = constrain_sizing((0, 0, 1616, 100), 8, a, (16, 39));
+        assert_eq!((r - l - 16, b - t - 39), (1600, 900));
+    }
+
     #[test]
     #[ignore]
     fn keyboard_hook_receives_keys() {

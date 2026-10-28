@@ -258,6 +258,8 @@ struct App {
     /// Curseur transparent du mode contrôle. On ne passe pas par `set_cursor_visible(false)` :
     /// winit verrouille alors le curseur sur un seul pixel au centre de la fenêtre.
     blank_cursor: Option<CustomCursor>,
+    /// Affiche le cadre du mode contrôle en permanence (vérification visuelle, PIP_DEBUG_BORDER).
+    debug_border: bool,
     /// Compteurs du mode contrôle (diagnostic) : mouvements, clics, touches envoyés.
     sent: (u32, u32, Arc<std::sync::atomic::AtomicU32>),
 }
@@ -273,6 +275,7 @@ impl App {
             buttons_down: HashSet::new(),
             keyboard_hooked: false,
             blank_cursor: None,
+            debug_border: std::env::var("PIP_DEBUG_BORDER").is_ok(),
             sent: (0, 0, Arc::default()),
             window: None,
             hwnd: None,
@@ -702,8 +705,10 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(frame) = self.slot.lock().unwrap().take() {
                     r.upload(&frame);
                 }
-                let border = self.control.then_some(wgpu::Color { r: 1.0, g: 0.45, b: 0.0, a: 1.0 });
-                r.render(self.cfg.keep_aspect, border);
+                // Redimensionnement à la souris proportionnel à l'image (si « garder le ratio »).
+                let aspect = r.video_size().map(|(w, h)| w as f64 / h.max(1) as f64);
+                win::set_resize_aspect(aspect.filter(|_| self.cfg.keep_aspect));
+                r.render(self.cfg.keep_aspect, self.control || self.debug_border);
                 // Le ratio de la vidéo est maintenant connu : on recale la disposition PiP.
                 if !self.layout_applied && r.video_size().is_some() {
                     self.layout_applied = true;
