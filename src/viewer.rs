@@ -248,8 +248,12 @@ struct App {
     /// Mode contrôle (KVM) : souris et clavier pilotent la source.
     control: bool,
     /// Touches et boutons enfoncés pendant le contrôle, relâchés à la sortie.
-    keys_down: HashSet<u16>,
+    keys_down: Arc<Mutex<HashSet<u16>>>,
     buttons_down: HashSet<u8>,
+    /// Le clavier est capturé par le hook bas niveau (touche Windows, Alt+Tab…).
+    keyboard_hooked: bool,
+    /// Compteurs du mode contrôle (diagnostic) : mouvements, clics, touches envoyés.
+    sent: (u32, u32, Arc<std::sync::atomic::AtomicU32>),
 }
 
 impl App {
@@ -259,8 +263,10 @@ impl App {
             slot,
             link,
             control: false,
-            keys_down: HashSet::new(),
+            keys_down: Arc::default(),
             buttons_down: HashSet::new(),
+            keyboard_hooked: false,
+            sent: (0, 0, Arc::default()),
             window: None,
             hwnd: None,
             renderer: None,
@@ -454,6 +460,25 @@ impl App {
         // que celui de l'autre PC, dans l'image.
         let _ = window.set_cursor_grab(CursorGrabMode::Confined);
         window.set_cursor_visible(false);
+        // Tout le clavier part vers l'autre PC, y compris la touche Windows et Alt+Tab.
+        let (link, keys_down, keys_sent) = (self.link.clone(), self.keys_down.clone(), self.sent.2.clone());
+        self.keyboard_hooked = win::start_keyboard_capture(Box::new(move |sc, down| {
+            if down {
+                keys_down.lock().unwrap().insert(sc);
+            } else {
+                keys_down.lock().unwrap().remove(&sc);
+            }
+            keys_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut p = sc.to_le_bytes().to_vec();
+            p.push(u8::from(down));
+            send_request(&link, IN_KEY, &p);
+        }));
+        if !self.keyboard_hooked {
+            eprintln!("Capture complète du clavier indisponible : la touche Windows et Alt+Tab resteront sur ce PC");
+        }
+        self.sent.0 = 0;
+        self.sent.1 = 0;
+        self.sent.2.store(0, std::sync::atomic::Ordering::Relaxed);
         eprintln!("Contrôle à distance : ACTIF (Ctrl+Alt+K pour rendre la main)");
         self.request_redraw();
     }
@@ -463,8 +488,11 @@ impl App {
             return;
         }
         self.control = false;
+        win::stop_keyboard_capture();
+        self.keyboard_hooked = false;
         // Jamais de touche ou de bouton coincé sur l'autre PC.
-        for sc in self.keys_down.drain() {
+        let keys: Vec<u16> = self.keys_down.lock().unwrap().drain().collect();
+        for sc in keys {
             let mut p = sc.to_le_bytes().to_vec();
             p.push(0);
             send_request(&self.link, IN_KEY, &p);
@@ -478,7 +506,12 @@ impl App {
         }
         self.hovered = false;
         self.apply_opacity();
-        eprintln!("Contrôle à distance : rendu");
+        eprintln!(
+            "Contrôle à distance : rendu ({} mouvements de souris, {} clics/molette, {} touches envoyés)",
+            self.sent.0,
+            self.sent.1,
+            self.sent.2.load(std::sync::atomic::Ordering::Relaxed)
+        );
         self.request_redraw();
     }
 
@@ -493,6 +526,7 @@ impl App {
                 let mut p = ((fx * 65535.0) as u16).to_le_bytes().to_vec();
                 p.extend_from_slice(&((fy * 65535.0) as u16).to_le_bytes());
                 send_request(&self.link, IN_MOUSE_MOVE, &p);
+                self.sent.0 += 1;
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let b = match button {
@@ -510,6 +544,7 @@ impl App {
                     self.buttons_down.remove(&b);
                 }
                 send_request(&self.link, IN_MOUSE_BUTTON, &[b, u8::from(down)]);
+                self.sent.1 += 1;
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
@@ -519,7 +554,10 @@ impl App {
                 let mut p = (dy as i16).to_le_bytes().to_vec();
                 p.extend_from_slice(&(dx as i16).to_le_bytes());
                 send_request(&self.link, IN_WHEEL, &p);
+                self.sent.1 += 1;
             }
+            // Avec le hook, le clavier est déjà envoyé (et bloqué) avant d'arriver ici.
+            WindowEvent::KeyboardInput { .. } if self.keyboard_hooked => {}
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(_) = event.physical_key
                     && let Some(sc) = event.physical_key.to_scancode()
@@ -527,10 +565,11 @@ impl App {
                     let sc = sc as u16;
                     let down = event.state == ElementState::Pressed;
                     if down {
-                        self.keys_down.insert(sc);
+                        self.keys_down.lock().unwrap().insert(sc);
                     } else {
-                        self.keys_down.remove(&sc);
+                        self.keys_down.lock().unwrap().remove(&sc);
                     }
+                    self.sent.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let mut p = sc.to_le_bytes().to_vec();
                     p.push(u8::from(down));
                     send_request(&self.link, IN_KEY, &p);

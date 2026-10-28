@@ -137,7 +137,24 @@ fn stream_to(
         std::thread::spawn(move || {
             let mut authed = false;
             let mut failures = 0;
+            // Diagnostic : entrées appliquées / refusées par Windows, affiché toutes les 3 s.
+            let mut applied = [0u32; 3];
+            let mut refused = 0u32;
+            let mut last_report = Instant::now();
             while let Ok((kind, p)) = protocol::read_request(&mut reader) {
+                if last_report.elapsed() >= Duration::from_secs(3) && applied.iter().sum::<u32>() + refused > 0 {
+                    eprintln!(
+                        "Contrôle : {} mouvements, {} clics/molette, {} touches appliqués ; {} refusés par Windows",
+                        applied[0], applied[1], applied[2], refused
+                    );
+                    if refused > 0 {
+                        eprintln!("  (refus = la fenêtre active de ce PC est lancée en administrateur ou c'est un écran protégé)");
+                    }
+                    applied = [0; 3];
+                    refused = 0;
+                    last_report = Instant::now();
+                }
+                let mut count = |slot: usize, ok: bool| if ok { applied[slot] += 1 } else { refused += 1 };
                 match kind {
                     REQ_KEYFRAME => keyframe_requested.store(true, Ordering::Relaxed),
                     REQ_AUTH => {
@@ -156,13 +173,13 @@ fn stream_to(
                     // Les entrées ne sont appliquées qu'après validation du code.
                     _ if !authed => {}
                     IN_MOUSE_MOVE if p.len() == 4 => {
-                        injector.move_to(u16::from_le_bytes([p[0], p[1]]), u16::from_le_bytes([p[2], p[3]]))
+                        count(0, injector.move_to(u16::from_le_bytes([p[0], p[1]]), u16::from_le_bytes([p[2], p[3]])))
                     }
-                    IN_MOUSE_BUTTON if p.len() == 2 => injector.button(p[0], p[1] != 0),
+                    IN_MOUSE_BUTTON if p.len() == 2 => count(1, injector.button(p[0], p[1] != 0)),
                     IN_WHEEL if p.len() == 4 => {
-                        injector.wheel(i16::from_le_bytes([p[0], p[1]]), i16::from_le_bytes([p[2], p[3]]))
+                        count(1, injector.wheel(i16::from_le_bytes([p[0], p[1]]), i16::from_le_bytes([p[2], p[3]])))
                     }
-                    IN_KEY if p.len() == 3 => injector.key(u16::from_le_bytes([p[0], p[1]]), p[2] != 0),
+                    IN_KEY if p.len() == 3 => count(2, injector.key(u16::from_le_bytes([p[0], p[1]]), p[2] != 0)),
                     _ => {}
                 }
             }

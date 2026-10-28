@@ -195,7 +195,7 @@ impl Injector {
     }
 
     /// Position absolue, `x` et `y` de 0 à 65535 sur l'écran partagé.
-    pub fn move_to(&self, x: u16, y: u16) {
+    pub fn move_to(&self, x: u16, y: u16) -> bool {
         let (mx, my, mw, mh) = self.monitor;
         let px = mx + (x as i64 * (mw - 1).max(0) as i64 / 65535) as i32;
         let py = my + (y as i64 * (mh - 1).max(0) as i64 / 65535) as i32;
@@ -210,10 +210,10 @@ impl Injector {
         };
         let nx = ((px - vx) as i64 * 65535 / (vw - 1) as i64) as i32;
         let ny = ((py - vy) as i64 * 65535 / (vh - 1) as i64) as i32;
-        send_mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0);
+        send_mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0)
     }
 
-    pub fn button(&self, button: u8, down: bool) {
+    pub fn button(&self, button: u8, down: bool) -> bool {
         let (flags, data) = match (button, down) {
             (0, true) => (MOUSEEVENTF_LEFTDOWN, 0),
             (0, false) => (MOUSEEVENTF_LEFTUP, 0),
@@ -223,22 +223,24 @@ impl Injector {
             (2, false) => (MOUSEEVENTF_MIDDLEUP, 0),
             (3 | 4, true) => (MOUSEEVENTF_XDOWN, if button == 3 { 1 } else { 2 }),
             (3 | 4, false) => (MOUSEEVENTF_XUP, if button == 3 { 1 } else { 2 }),
-            _ => return,
+            _ => return false,
         };
-        send_mouse(flags, 0, 0, data);
+        send_mouse(flags, 0, 0, data)
     }
 
-    pub fn wheel(&self, vertical: i16, horizontal: i16) {
+    pub fn wheel(&self, vertical: i16, horizontal: i16) -> bool {
+        let mut ok = true;
         if vertical != 0 {
-            send_mouse(MOUSEEVENTF_WHEEL, 0, 0, vertical as i32 as u32);
+            ok &= send_mouse(MOUSEEVENTF_WHEEL, 0, 0, vertical as i32 as u32);
         }
         if horizontal != 0 {
-            send_mouse(MOUSEEVENTF_HWHEEL, 0, 0, horizontal as i32 as u32);
+            ok &= send_mouse(MOUSEEVENTF_HWHEEL, 0, 0, horizontal as i32 as u32);
         }
+        ok
     }
 
     /// Touche par scancode (indépendant de la disposition du clavier) ; 0xE0xx = touche étendue.
-    pub fn key(&self, scancode: u16, down: bool) {
+    pub fn key(&self, scancode: u16, down: bool) -> bool {
         let mut flags = KEYEVENTF_SCANCODE;
         if scancode & 0xFF00 == 0xE000 {
             flags |= KEYEVENTF_EXTENDEDKEY;
@@ -250,18 +252,89 @@ impl Injector {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: scancode & 0xFF, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
         };
-        unsafe {
-            SendInput(&[input], size_of::<INPUT>() as i32);
-        }
+        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) == 1 }
     }
 }
 
-fn send_mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) {
+/// `false` si Windows a refusé l'entrée (ex. fenêtre au premier plan lancée en administrateur).
+fn send_mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> bool {
     let input = INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
     };
+    unsafe { SendInput(&[input], size_of::<INPUT>() as i32) == 1 }
+}
+
+/// Reçoit chaque touche capturée : (scancode, enfoncée). 0xE0xx = touche étendue.
+type KeySink = Box<dyn Fn(u16, bool) + Send>;
+
+static KEY_SINK: std::sync::Mutex<Option<KeySink>> = std::sync::Mutex::new(None);
+static KEY_HOOK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+static ALT_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Mode contrôle : intercepte TOUT le clavier avant Windows (touche Windows, Alt+Tab,
+/// Ctrl+Échap…), l'envoie à `sink` et l'empêche d'agir sur ce PC. Ctrl+Alt+K reste
+/// géré localement (rendre la main). Ctrl+Alt+Suppr ne peut pas être intercepté.
+/// À appeler depuis le thread de la boucle d'évènements (le hook en dépend).
+pub fn start_keyboard_capture(sink: KeySink) -> bool {
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    *KEY_SINK.lock().unwrap() = Some(sink);
+    CTRL_DOWN.store(false, Ordering::Relaxed);
+    ALT_DOWN.store(false, Ordering::Relaxed);
+    if KEY_HOOK.load(Ordering::Relaxed) != 0 {
+        return true;
+    }
     unsafe {
-        SendInput(&[input], size_of::<INPUT>() as i32);
+        let module = GetModuleHandleW(None).ok().map(|m| windows::Win32::Foundation::HINSTANCE(m.0));
+        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), module, 0) {
+            Ok(h) => {
+                KEY_HOOK.store(h.0 as isize, Ordering::Relaxed);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+pub fn stop_keyboard_capture() {
+    let h = KEY_HOOK.swap(0, Ordering::Relaxed);
+    if h != 0 {
+        unsafe {
+            let _ = UnhookWindowsHookEx(HHOOK(h as *mut _));
+        }
+    }
+    *KEY_SINK.lock().unwrap() = None;
+}
+
+unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if code >= 0 {
+            let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+            // Les touches simulées par un autre programme passent normalement.
+            if !k.flags.contains(LLKHF_INJECTED) {
+                let down = !k.flags.contains(LLKHF_UP);
+                let vk = k.vkCode as u16;
+                if vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0 || vk == VK_CONTROL.0 {
+                    CTRL_DOWN.store(down, Ordering::Relaxed);
+                }
+                if vk == VK_LMENU.0 || vk == VK_RMENU.0 || vk == VK_MENU.0 {
+                    ALT_DOWN.store(down, Ordering::Relaxed);
+                }
+                if down && vk == u16::from(b'K') && CTRL_DOWN.load(Ordering::Relaxed) && ALT_DOWN.load(Ordering::Relaxed) {
+                    HOTKEY_PRESSED.store(true, Ordering::Relaxed);
+                    return LRESULT(1);
+                }
+                let mut sc = (k.scanCode & 0xFF) as u16;
+                if k.flags.contains(LLKHF_EXTENDED) {
+                    sc |= 0xE000;
+                }
+                if let Some(sink) = KEY_SINK.lock().unwrap().as_ref() {
+                    sink(sc, down);
+                    return LRESULT(1);
+                }
+            }
+        }
+        CallNextHookEx(None, code, wparam, lparam)
     }
 }
