@@ -368,7 +368,10 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        self.hwnd = Hwnd::of(&window);
+        self.hwnd = Hwnd::of(&*window);
+        if let Some(h) = self.hwnd {
+            h.follow_suggested_dpi_rect();
+        }
         match Renderer::new(window.clone()) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {

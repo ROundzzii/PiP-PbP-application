@@ -33,7 +33,16 @@ pub fn run() -> anyhow::Result<()> {
             .with_min_inner_size([560.0, 420.0]),
         ..Default::default()
     };
-    eframe::run_native("PiP-PbP", options, Box::new(|_cc| Ok(Box::new(Gui::new()))))
+    eframe::run_native(
+        "PiP-PbP",
+        options,
+        Box::new(|cc| {
+            if let Some(h) = win::Hwnd::of(cc) {
+                h.follow_suggested_dpi_rect();
+            }
+            Ok(Box::new(Gui::new()))
+        }),
+    )
         .map_err(|e| anyhow::anyhow!("interface : {e}"))
 }
 

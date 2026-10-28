@@ -2,18 +2,19 @@
 //! fenêtre (fenêtre « layered »), position du curseur, zone de travail de l'écran.
 
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
+use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::Window;
 
 #[derive(Clone, Copy)]
 pub struct Hwnd(HWND);
 
 impl Hwnd {
-    pub fn of(window: &Window) -> Option<Self> {
+    pub fn of(window: &impl HasWindowHandle) -> Option<Self> {
         match window.window_handle().ok()?.as_raw() {
             RawWindowHandle::Win32(h) => Some(Self(HWND(h.hwnd.get() as *mut _))),
             _ => None,
@@ -43,6 +44,18 @@ impl Hwnd {
                 return false;
             }
             p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+        }
+    }
+
+    /// Corrige le passage d'un écran à l'autre quand leurs échelles diffèrent (ex. 100 %
+    /// et 150 %). Windows propose dans WM_DPICHANGED un rectangle calculé pour que la
+    /// fenêtre reste sous le curseur ; winit l'ignore et recalcule sa propre taille, la
+    /// fenêtre grossit, repasse en majorité sur l'écran de départ et rebondit.
+    /// On laisse winit traiter le message (mise à l'échelle du contenu), puis on applique
+    /// le rectangle proposé par Windows.
+    pub fn follow_suggested_dpi_rect(self) {
+        unsafe {
+            let _ = SetWindowSubclass(self.0, Some(dpi_subclass_proc), 0x5049_5050, 0);
         }
     }
 
@@ -113,4 +126,31 @@ pub fn allow_in_firewall() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+unsafe extern "system" fn dpi_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    unsafe {
+        if msg != WM_DPICHANGED {
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+        }
+        let r = *(lparam.0 as *const RECT);
+        let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        result
+    }
 }
