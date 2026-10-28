@@ -365,6 +365,19 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
     }
 }
 
+/// Simule F24 (absente des claviers, sans effet) : sert à vérifier que le hook clavier
+/// reçoit bien les touches.
+pub fn send_f24() {
+    for up in [false, true] {
+        let flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_F24, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        };
+        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

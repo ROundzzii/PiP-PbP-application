@@ -63,6 +63,9 @@ type Slot = Arc<Mutex<Option<Frame>>>;
 
 pub fn run(cfg: ViewConfig) -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    // Pas d'abonnement « Raw Input » de winit (inutile ici) : il empêche le hook clavier
+    // du mode contrôle de recevoir les touches.
+    event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
     let slot: Slot = Arc::default();
     let link: SharedLink = Arc::default();
     {
@@ -638,6 +641,18 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         self.window = Some(window);
+        // Autotest du hook clavier dans les conditions réelles (variable PIP_HOOK_SELFTEST).
+        if std::env::var("PIP_HOOK_SELFTEST").is_ok() {
+            let started = win::start_keyboard_capture(Box::new(|_, _| {}));
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                win::send_f24();
+                std::thread::sleep(Duration::from_millis(500));
+                let (seen, injected) = win::keyboard_hook_stats();
+                eprintln!("AUTOTEST hook : démarré={started}, touches vues={seen} (simulées {injected})");
+                win::stop_keyboard_capture();
+            });
+        }
         self.apply_opacity();
         let layout = self.cfg.layout.clone();
         self.apply_layout(&layout);
