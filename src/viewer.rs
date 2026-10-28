@@ -17,7 +17,7 @@ use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId, W
 
 use crate::config::ViewConfig;
 use crate::discovery;
-use crate::protocol::{self, MAGIC, MSG_VIDEO, REQ_KEYFRAME};
+use crate::protocol::{self, MAGIC, MSG_REPLACED, MSG_VIDEO, REQ_KEYFRAME};
 use crate::render::{Frame, Renderer};
 use crate::win::{self, Hwnd};
 
@@ -29,6 +29,8 @@ const RESIZE_BORDER: f64 = 8.0;
 enum UserEvent {
     NewFrame,
     Status(String),
+    /// Un autre viewer a pris la place de celui-ci sur la source.
+    Replaced,
 }
 
 /// Dernière image décodée : le réseau écrase, l'affichage prend.
@@ -66,14 +68,20 @@ fn network_loop(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserE
         };
         let _ = proxy.send_event(UserEvent::Status(format!("Connexion à {host}:{port}…")));
         match receive(&host, port, slot, proxy) {
-            Ok(()) => eprintln!("Connexion fermée par la source"),
+            Ok(true) => {
+                eprintln!("Une autre fenêtre affiche maintenant cette source : fermeture.");
+                let _ = proxy.send_event(UserEvent::Replaced);
+                return;
+            }
+            Ok(false) => eprintln!("Connexion fermée par la source"),
             Err(e) => eprintln!("Connexion : {e:#}"),
         }
         std::thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn receive(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>) -> anyhow::Result<()> {
+/// Renvoie `Ok(true)` si la source signale qu'un autre viewer a pris la place.
+fn receive(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>) -> anyhow::Result<bool> {
     let stream = connect(host, port)?;
     stream.set_nodelay(true)?;
     let mut requests = stream.try_clone()?;
@@ -91,8 +99,10 @@ fn receive(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>
     let mut buf = Vec::new();
     let mut stats = (Instant::now(), 0u32, 0.0f64);
     loop {
-        if protocol::read_packet(&mut reader, &mut buf)? != MSG_VIDEO {
-            continue;
+        match protocol::read_packet(&mut reader, &mut buf)? {
+            MSG_VIDEO => {}
+            MSG_REPLACED => return Ok(true),
+            _ => continue,
         }
         let t0 = Instant::now();
         match decoder.decode(&buf) {
@@ -387,9 +397,10 @@ impl ApplicationHandler<UserEvent> for App {
         self.request_redraw();
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::NewFrame => self.request_redraw(),
+            UserEvent::Replaced => event_loop.exit(),
             UserEvent::Status(s) => {
                 if let Some(w) = &self.window {
                     w.set_title(&s);

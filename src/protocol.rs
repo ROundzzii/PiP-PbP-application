@@ -9,6 +9,8 @@ pub const MAGIC: &[u8; 8] = b"PIPPBP01";
 
 /// Paquet vidéo : un frame H.264 (Annex B) complet.
 pub const MSG_VIDEO: u8 = 1;
+/// Un autre viewer a pris la place de celui-ci : il doit se fermer sans se reconnecter.
+pub const MSG_REPLACED: u8 = 2;
 
 /// Requête du viewer : envoyer une image clé (après une erreur de décodage).
 pub const REQ_KEYFRAME: u8 = 1;

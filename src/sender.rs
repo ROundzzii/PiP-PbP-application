@@ -16,7 +16,7 @@ use openh264::encoder::{
 use crate::capture::{Capturer, FrameStatus};
 use crate::config::SendConfig;
 use crate::discovery;
-use crate::protocol::{self, MAGIC, MSG_VIDEO, REQ_KEYFRAME};
+use crate::protocol::{self, MAGIC, MSG_REPLACED, MSG_VIDEO, REQ_KEYFRAME};
 use crate::yuv::I420;
 
 /// Nombre max de paquets en attente d'envoi. Au-delà, on saute des images plutôt que
@@ -33,27 +33,51 @@ pub fn run(cfg: SendConfig) -> anyhow::Result<()> {
     }
     let mut capturer = Capturer::new(cfg.monitor, cfg.show_cursor)?;
 
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Connexion refusée : {e}");
-                continue;
+    // Les connexions arrivent dans un thread à part : un nouveau viewer remplace
+    // l'actuel au lieu d'attendre indéfiniment (écran noir) qu'il se déconnecte.
+    let (conn_tx, conn_rx) = mpsc::channel::<TcpStream>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    if conn_tx.send(s).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => eprintln!("Connexion refusée : {e}"),
             }
-        };
+        }
+    });
+
+    let mut next = conn_rx.recv().ok();
+    while let Some(stream) = next.take() {
         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         eprintln!("Viewer connecté : {peer}");
-        match stream_to(stream, &cfg, &mut capturer) {
-            Ok(()) => eprintln!("Viewer {peer} déconnecté"),
+        match stream_to(stream, &cfg, &mut capturer, &conn_rx) {
+            Ok(Some(newer)) => {
+                eprintln!("Viewer {peer} remplacé par une nouvelle connexion");
+                next = Some(newer);
+                continue;
+            }
+            Ok(None) => eprintln!("Viewer {peer} déconnecté"),
             Err(e) => eprintln!("Viewer {peer} déconnecté : {e:#}"),
         }
+        next = conn_rx.recv().ok();
     }
     Ok(())
 }
 
-fn stream_to(stream: TcpStream, cfg: &SendConfig, capturer: &mut Capturer) -> anyhow::Result<()> {
+/// Envoie la vidéo jusqu'à la déconnexion du viewer, ou jusqu'à l'arrivée d'un
+/// nouveau viewer (renvoyé pour être servi à la place).
+fn stream_to(
+    stream: TcpStream,
+    cfg: &SendConfig,
+    capturer: &mut Capturer,
+    newer: &mpsc::Receiver<TcpStream>,
+) -> anyhow::Result<Option<TcpStream>> {
     stream.set_nodelay(true)?;
     let mut reader = stream.try_clone()?;
+    let reader_shutdown = stream.try_clone()?;
     let mut writer = BufWriter::with_capacity(1 << 20, stream);
     std::io::Write::write_all(&mut writer, MAGIC)?;
 
@@ -102,7 +126,12 @@ fn stream_to(stream: TcpStream, cfg: &SendConfig, capturer: &mut Capturer) -> an
     let mut yuv = I420::new();
     let mut stats = Stats::new();
 
+    let mut replaced_by = None;
     while alive.load(Ordering::Relaxed) {
+        if let Ok(s) = newer.try_recv() {
+            replaced_by = Some(s);
+            break;
+        }
         // Image en attente : on n'attend que jusqu'au prochain créneau d'envoi.
         let wait = if dirty { next_allowed.saturating_duration_since(Instant::now()) } else { interval };
         if let FrameStatus::Updated = capturer.next_frame(wait.as_millis().max(1) as u32)? {
@@ -141,7 +170,12 @@ fn stream_to(stream: TcpStream, cfg: &SendConfig, capturer: &mut Capturer) -> an
     }
     drop(tx);
     let _ = net.join();
-    Ok(())
+    // Prévient l'ancien viewer qu'il est remplacé (il se ferme au lieu de se reconnecter).
+    if replaced_by.is_some() {
+        let _ = protocol::write_packet(&mut &reader_shutdown, MSG_REPLACED, &[]);
+    }
+    let _ = reader_shutdown.shutdown(std::net::Shutdown::Both);
+    Ok(replaced_by)
 }
 
 /// Mesure les temps de conversion et d'encodage sans réseau (`pip-pbp bench`).
