@@ -1,6 +1,7 @@
 //! Côté affichage : réception TCP -> décodage H.264 -> fenêtre PiP/PbP.
 
-use std::io::{BufReader, Read, Write};
+use std::collections::HashSet;
+use std::io::{BufReader, Read};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,13 +13,17 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{CursorIcon, Fullscreen, ResizeDirection, Window, WindowId, WindowLevel};
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
+use winit::platform::scancode::PhysicalKeyExtScancode;
+use winit::window::{CursorGrabMode, CursorIcon, Fullscreen, ResizeDirection, Window, WindowId, WindowLevel};
 
 use crate::config::ViewConfig;
 use crate::discovery;
-use crate::protocol::{self, MAGIC, MSG_REPLACED, MSG_VIDEO, REQ_KEYFRAME};
-use crate::render::{Frame, Renderer};
+use crate::protocol::{
+    self, IN_KEY, IN_MOUSE_BUTTON, IN_MOUSE_MOVE, IN_WHEEL, MAGIC, MSG_AUTH, MSG_HELLO, MSG_REPLACED, MSG_VIDEO,
+    REQ_AUTH, REQ_KEYFRAME,
+};
+use crate::render::{BORDER_WIDTH, Frame, Renderer};
 use crate::win::{self, Hwnd};
 
 /// Fréquence de vérification de la position de la souris (survol).
@@ -31,6 +36,25 @@ enum UserEvent {
     Status(String),
     /// Un autre viewer a pris la place de celui-ci sur la source.
     Replaced,
+    /// Connexion perdue : le mode contrôle doit être quitté.
+    Disconnected,
+}
+
+/// Canal de contrôle vers la source (souris / clavier), partagé avec la fenêtre.
+struct Link {
+    stream: TcpStream,
+    /// La source autorise le contrôle à distance.
+    allowed: bool,
+    /// La source a accepté notre code.
+    authed: bool,
+}
+
+type SharedLink = Arc<Mutex<Option<Link>>>;
+
+fn send_request(link: &SharedLink, kind: u8, payload: &[u8]) {
+    if let Some(l) = link.lock().unwrap().as_mut() {
+        let _ = protocol::write_request(&mut l.stream, kind, payload);
+    }
 }
 
 /// Dernière image décodée : le réseau écrase, l'affichage prend.
@@ -40,17 +64,19 @@ type Slot = Arc<Mutex<Option<Frame>>>;
 pub fn run(cfg: ViewConfig) -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let slot: Slot = Arc::default();
+    let link: SharedLink = Arc::default();
     {
-        let (slot, proxy, host, port) = (slot.clone(), event_loop.create_proxy(), cfg.host.clone(), cfg.port);
-        std::thread::spawn(move || network_loop(&host, port, &slot, &proxy));
+        let (slot, link, proxy) = (slot.clone(), link.clone(), event_loop.create_proxy());
+        let (host, port, code) = (cfg.host.clone(), cfg.port, cfg.control_code.clone());
+        std::thread::spawn(move || network_loop(&host, port, &code, &slot, &link, &proxy));
     }
-    let mut app = App::new(cfg, slot);
+    let mut app = App::new(cfg, slot, link);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
 /// `host` vide ou "auto" : la source est cherchée automatiquement sur le réseau local.
-fn network_loop(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>) {
+fn network_loop(host: &str, port: u16, code: &str, slot: &Slot, link: &SharedLink, proxy: &EventLoopProxy<UserEvent>) {
     let auto = host.is_empty() || host.eq_ignore_ascii_case("auto");
     loop {
         let host = if auto {
@@ -67,7 +93,10 @@ fn network_loop(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserE
             host.to_string()
         };
         let _ = proxy.send_event(UserEvent::Status(format!("Connexion à {host}:{port}…")));
-        match receive(&host, port, slot, proxy) {
+        let result = receive(&host, port, code, slot, link, proxy);
+        *link.lock().unwrap() = None;
+        let _ = proxy.send_event(UserEvent::Disconnected);
+        match result {
             Ok(true) => {
                 eprintln!("Une autre fenêtre affiche maintenant cette source : fermeture.");
                 let _ = proxy.send_event(UserEvent::Replaced);
@@ -81,10 +110,17 @@ fn network_loop(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserE
 }
 
 /// Renvoie `Ok(true)` si la source signale qu'un autre viewer a pris la place.
-fn receive(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>) -> anyhow::Result<bool> {
+fn receive(
+    host: &str,
+    port: u16,
+    code: &str,
+    slot: &Slot,
+    link: &SharedLink,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> anyhow::Result<bool> {
     let stream = connect(host, port)?;
     stream.set_nodelay(true)?;
-    let mut requests = stream.try_clone()?;
+    let requests = stream.try_clone()?;
     let mut reader = BufReader::with_capacity(1 << 20, stream);
 
     let mut magic = [0u8; 8];
@@ -95,13 +131,38 @@ fn receive(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>
     let _ = proxy.send_event(UserEvent::Status(format!("PiP – {host}")));
     eprintln!("Connecté à {host}:{port}");
 
-    let mut decoder = Decoder::new()?;
     let mut buf = Vec::new();
+    if protocol::read_packet(&mut reader, &mut buf)? != MSG_HELLO || buf.len() != 1 + protocol::NONCE_LEN {
+        bail!("réponse inattendue de la source (versions différentes ?)");
+    }
+    let allowed = buf[0] != 0;
+    *link.lock().unwrap() = Some(Link { stream: requests, allowed, authed: false });
+    if !allowed {
+        eprintln!("Contrôle à distance : non autorisé par la source (affichage seul)");
+    } else if code.trim().is_empty() {
+        eprintln!("Contrôle à distance : autorisé par la source, mais aucun code saisi pour cette connexion");
+    } else {
+        send_request(link, REQ_AUTH, &protocol::auth_proof(code, &buf[1..]));
+    }
+
+    let mut decoder = Decoder::new()?;
     let mut stats = (Instant::now(), 0u32, 0.0f64);
     loop {
         match protocol::read_packet(&mut reader, &mut buf)? {
             MSG_VIDEO => {}
             MSG_REPLACED => return Ok(true),
+            MSG_AUTH => {
+                let ok = buf.first() == Some(&1);
+                if let Some(l) = link.lock().unwrap().as_mut() {
+                    l.authed = ok;
+                }
+                if ok {
+                    eprintln!("Contrôle à distance : prêt — Ctrl+Alt+K pour prendre / rendre la main");
+                } else {
+                    eprintln!("Contrôle à distance : code refusé par la source");
+                }
+                continue;
+            }
             _ => continue,
         }
         let t0 = Instant::now();
@@ -114,7 +175,7 @@ fn receive(host: &str, port: u16, slot: &Slot, proxy: &EventLoopProxy<UserEvent>
             Ok(None) => {}
             Err(e) => {
                 eprintln!("Erreur de décodage ({e}), demande d'une image clé");
-                requests.write_all(&[REQ_KEYFRAME])?;
+                send_request(link, REQ_KEYFRAME, &[]);
             }
         }
         stats.1 += 1;
@@ -183,13 +244,23 @@ struct App {
     modifiers: ModifiersState,
     last_click: Option<Instant>,
     layout_applied: bool,
+    link: SharedLink,
+    /// Mode contrôle (KVM) : souris et clavier pilotent la source.
+    control: bool,
+    /// Touches et boutons enfoncés pendant le contrôle, relâchés à la sortie.
+    keys_down: HashSet<u16>,
+    buttons_down: HashSet<u8>,
 }
 
 impl App {
-    fn new(cfg: ViewConfig, slot: Slot) -> Self {
+    fn new(cfg: ViewConfig, slot: Slot, link: SharedLink) -> Self {
         Self {
             cfg,
             slot,
+            link,
+            control: false,
+            keys_down: HashSet::new(),
+            buttons_down: HashSet::new(),
             window: None,
             hwnd: None,
             renderer: None,
@@ -202,6 +273,9 @@ impl App {
     }
 
     fn update_hover(&mut self) {
+        if self.control {
+            return;
+        }
         let (Some(window), Some(hwnd)) = (&self.window, self.hwnd) else { return };
         let hovered = hwnd.cursor_inside() && !win::alt_down();
         if hovered == self.hovered {
@@ -348,6 +422,125 @@ impl App {
         }
     }
 
+    /// Ctrl+Alt+K : prend ou rend la main sur la source.
+    fn toggle_control(&mut self) {
+        if self.control {
+            self.exit_control();
+            return;
+        }
+        let state = self.link.lock().unwrap().as_ref().map(|l| (l.allowed, l.authed));
+        let refusal = match state {
+            None => Some("pas connecté à une source"),
+            Some((false, _)) => Some("la source n'autorise pas le contrôle (case à cocher dans « Partager cet écran »)"),
+            Some((true, false)) if self.cfg.control_code.trim().is_empty() => {
+                Some("aucun code saisi pour cette connexion (onglet Connexions)")
+            }
+            Some((true, false)) => Some("code refusé par la source"),
+            Some((true, true)) => None,
+        };
+        if let Some(reason) = refusal {
+            eprintln!("Contrôle à distance impossible : {reason}");
+            return;
+        }
+        let Some(window) = self.window.clone() else { return };
+        self.control = true;
+        self.hovered = false;
+        let _ = window.set_cursor_hittest(true);
+        if let Some(h) = self.hwnd {
+            h.set_opacity(1.0);
+        }
+        window.focus_window();
+        // La souris reste dans la fenêtre et le curseur local disparaît : on ne voit plus
+        // que celui de l'autre PC, dans l'image.
+        let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+        window.set_cursor_visible(false);
+        eprintln!("Contrôle à distance : ACTIF (Ctrl+Alt+K pour rendre la main)");
+        self.request_redraw();
+    }
+
+    fn exit_control(&mut self) {
+        if !self.control {
+            return;
+        }
+        self.control = false;
+        // Jamais de touche ou de bouton coincé sur l'autre PC.
+        for sc in self.keys_down.drain() {
+            let mut p = sc.to_le_bytes().to_vec();
+            p.push(0);
+            send_request(&self.link, IN_KEY, &p);
+        }
+        for b in self.buttons_down.drain() {
+            send_request(&self.link, IN_MOUSE_BUTTON, &[b, 0]);
+        }
+        if let Some(window) = &self.window {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+        self.hovered = false;
+        self.apply_opacity();
+        eprintln!("Contrôle à distance : rendu");
+        self.request_redraw();
+    }
+
+    /// Mode contrôle : transmet l'évènement à la source. Renvoie `true` s'il est consommé.
+    fn forward_input(&mut self, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                let rect = self.renderer.as_ref().and_then(|r| r.video_rect(self.cfg.keep_aspect, BORDER_WIDTH));
+                let Some((x, y, w, h)) = rect else { return true };
+                let fx = ((position.x as f32 - x) / w).clamp(0.0, 1.0);
+                let fy = ((position.y as f32 - y) / h).clamp(0.0, 1.0);
+                let mut p = ((fx * 65535.0) as u16).to_le_bytes().to_vec();
+                p.extend_from_slice(&((fy * 65535.0) as u16).to_le_bytes());
+                send_request(&self.link, IN_MOUSE_MOVE, &p);
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let b = match button {
+                    MouseButton::Left => 0,
+                    MouseButton::Right => 1,
+                    MouseButton::Middle => 2,
+                    MouseButton::Back => 3,
+                    MouseButton::Forward => 4,
+                    MouseButton::Other(_) => return true,
+                };
+                let down = *state == ElementState::Pressed;
+                if down {
+                    self.buttons_down.insert(b);
+                } else {
+                    self.buttons_down.remove(&b);
+                }
+                send_request(&self.link, IN_MOUSE_BUTTON, &[b, u8::from(down)]);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x * 120.0, y * 120.0),
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
+                };
+                let mut p = (dy as i16).to_le_bytes().to_vec();
+                p.extend_from_slice(&(dx as i16).to_le_bytes());
+                send_request(&self.link, IN_WHEEL, &p);
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(_) = event.physical_key
+                    && let Some(sc) = event.physical_key.to_scancode()
+                {
+                    let sc = sc as u16;
+                    let down = event.state == ElementState::Pressed;
+                    if down {
+                        self.keys_down.insert(sc);
+                    } else {
+                        self.keys_down.remove(&sc);
+                    }
+                    let mut p = sc.to_le_bytes().to_vec();
+                    p.push(u8::from(down));
+                    send_request(&self.link, IN_KEY, &p);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
@@ -381,6 +574,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.hwnd = Hwnd::of(&*window);
         if let Some(h) = self.hwnd {
             h.follow_suggested_dpi_rect();
+            if !h.register_control_hotkey() {
+                eprintln!("Raccourci Ctrl+Alt+K indisponible (déjà utilisé par une autre application)");
+            }
         }
         match Renderer::new(window.clone()) {
             Ok(r) => self.renderer = Some(r),
@@ -401,6 +597,7 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::NewFrame => self.request_redraw(),
             UserEvent::Replaced => event_loop.exit(),
+            UserEvent::Disconnected => self.exit_control(),
             UserEvent::Status(s) => {
                 if let Some(w) = &self.window {
                     w.set_title(&s);
@@ -410,11 +607,22 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if win::take_control_hotkey() {
+            self.toggle_control();
+        }
         self.update_hover();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + HOVER_POLL));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        if self.control {
+            if let WindowEvent::Focused(false) = event {
+                // Alt+Tab ou clic ailleurs : on rend la main, par sécurité.
+                self.exit_control();
+            } else if self.forward_input(&event) {
+                return;
+            }
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -428,7 +636,8 @@ impl ApplicationHandler<UserEvent> for App {
                 if let Some(frame) = self.slot.lock().unwrap().take() {
                     r.upload(&frame);
                 }
-                r.render(self.cfg.keep_aspect);
+                let border = self.control.then_some(wgpu::Color { r: 1.0, g: 0.45, b: 0.0, a: 1.0 });
+                r.render(self.cfg.keep_aspect, border);
                 // Le ratio de la vidéo est maintenant connu : on recale la disposition PiP.
                 if !self.layout_applied && r.video_size().is_some() {
                     self.layout_applied = true;

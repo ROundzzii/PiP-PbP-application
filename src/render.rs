@@ -15,6 +15,9 @@ pub struct Frame {
     pub v: Vec<u8>,
 }
 
+/// Épaisseur du liseré du mode contrôle, en pixels.
+pub const BORDER_WIDTH: f32 = 4.0;
+
 struct Planes {
     width: u32,
     height: u32,
@@ -240,7 +243,28 @@ impl Renderer {
         Planes { width, height, y, u, v, bind_group }
     }
 
-    pub fn render(&mut self, keep_aspect: bool) {
+    /// Zone de la fenêtre où l'image est dessinée (bandes noires exclues), en pixels.
+    /// `inset` réserve une bordure (liseré du mode contrôle).
+    pub fn video_rect(&self, keep_aspect: bool, inset: f32) -> Option<(f32, f32, f32, f32)> {
+        let p = self.planes.as_ref()?;
+        let (sw, sh) = (self.config.width as f32 - 2.0 * inset, self.config.height as f32 - 2.0 * inset);
+        if sw < 1.0 || sh < 1.0 {
+            return None;
+        }
+        let (mut x, mut y, mut w, mut h) = (0.0, 0.0, sw, sh);
+        if keep_aspect {
+            let scale = (sw / p.width as f32).min(sh / p.height as f32);
+            w = (p.width as f32 * scale).round().max(1.0);
+            h = (p.height as f32 * scale).round().max(1.0);
+            x = ((sw - w) / 2.0).floor();
+            y = ((sh - h) / 2.0).floor();
+        }
+        Some((x + inset, y + inset, w, h))
+    }
+
+    /// `border` : couleur du liseré affiché autour de l'image (mode contrôle).
+    pub fn render(&mut self, keep_aspect: bool, border: Option<wgpu::Color>) {
+        let inset = if border.is_some() { BORDER_WIDTH } else { 0.0 };
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -258,23 +282,17 @@ impl Renderer {
                     view: &target,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(border.unwrap_or(wgpu::Color::BLACK)),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some(p) = &self.planes {
-                let (sw, sh) = (self.config.width as f32, self.config.height as f32);
-                let (mut x, mut y, mut w, mut h) = (0.0, 0.0, sw, sh);
-                if keep_aspect {
-                    let scale = (sw / p.width as f32).min(sh / p.height as f32);
-                    w = (p.width as f32 * scale).round().max(1.0);
-                    h = (p.height as f32 * scale).round().max(1.0);
-                    x = ((sw - w) / 2.0).floor();
-                    y = ((sh - h) / 2.0).floor();
-                }
+            if let (Some(p), Some((x, y, w, h))) = (&self.planes, self.video_rect(keep_aspect, inset)) {
                 pass.set_viewport(x, y, w, h, 0.0, 1.0);
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &p.bind_group, &[]);

@@ -6,8 +6,10 @@ use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 #[derive(Clone, Copy)]
@@ -57,6 +59,12 @@ impl Hwnd {
         unsafe {
             let _ = SetWindowSubclass(self.0, Some(dpi_subclass_proc), 0x5049_5050, 0);
         }
+    }
+
+    /// Raccourci global Ctrl+Alt+K (mode contrôle), reçu même quand la fenêtre n'a pas
+    /// le focus. Nécessite `follow_suggested_dpi_rect` (même sous-classement de fenêtre).
+    pub fn register_control_hotkey(self) -> bool {
+        unsafe { RegisterHotKey(Some(self.0), HOTKEY_CONTROL_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, u32::from(b'K')).is_ok() }
     }
 
     /// Zone de travail (écran moins la barre des tâches) de l'écran qui contient la fenêtre.
@@ -137,6 +145,10 @@ unsafe extern "system" fn dpi_subclass_proc(
     _data: usize,
 ) -> LRESULT {
     unsafe {
+        if msg == WM_HOTKEY && wparam.0 as i32 == HOTKEY_CONTROL_ID {
+            HOTKEY_PRESSED.store(true, Ordering::Relaxed);
+            return LRESULT(0);
+        }
         if msg != WM_DPICHANGED {
             return DefSubclassProc(hwnd, msg, wparam, lparam);
         }
@@ -152,5 +164,104 @@ unsafe extern "system" fn dpi_subclass_proc(
             SWP_NOZORDER | SWP_NOACTIVATE,
         );
         result
+    }
+}
+
+const HOTKEY_CONTROL_ID: i32 = 0x5050;
+static HOTKEY_PRESSED: AtomicBool = AtomicBool::new(false);
+
+/// Renvoie `true` (une seule fois) si Ctrl+Alt+K a été pressé depuis le dernier appel.
+pub fn take_control_hotkey() -> bool {
+    HOTKEY_PRESSED.swap(false, Ordering::Relaxed)
+}
+
+/// Coordonnées en pixels physiques, y compris pour SendInput (écrans à 150 %, etc.).
+pub fn make_dpi_aware() {
+    use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// Reproduit sur ce PC la souris et le clavier envoyés par le viewer, sur l'écran partagé.
+pub struct Injector {
+    /// Écran partagé en pixels physiques : x, y, largeur, hauteur.
+    monitor: (i32, i32, i32, i32),
+}
+
+impl Injector {
+    pub fn new(monitor: (i32, i32, i32, i32)) -> Self {
+        Self { monitor }
+    }
+
+    /// Position absolue, `x` et `y` de 0 à 65535 sur l'écran partagé.
+    pub fn move_to(&self, x: u16, y: u16) {
+        let (mx, my, mw, mh) = self.monitor;
+        let px = mx + (x as i64 * (mw - 1).max(0) as i64 / 65535) as i32;
+        let py = my + (y as i64 * (mh - 1).max(0) as i64 / 65535) as i32;
+        // SendInput absolu : coordonnées normalisées sur tout le bureau virtuel.
+        let (vx, vy, vw, vh) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN).max(2),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN).max(2),
+            )
+        };
+        let nx = ((px - vx) as i64 * 65535 / (vw - 1) as i64) as i32;
+        let ny = ((py - vy) as i64 * 65535 / (vh - 1) as i64) as i32;
+        send_mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0);
+    }
+
+    pub fn button(&self, button: u8, down: bool) {
+        let (flags, data) = match (button, down) {
+            (0, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+            (0, false) => (MOUSEEVENTF_LEFTUP, 0),
+            (1, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+            (1, false) => (MOUSEEVENTF_RIGHTUP, 0),
+            (2, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+            (2, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+            (3 | 4, true) => (MOUSEEVENTF_XDOWN, if button == 3 { 1 } else { 2 }),
+            (3 | 4, false) => (MOUSEEVENTF_XUP, if button == 3 { 1 } else { 2 }),
+            _ => return,
+        };
+        send_mouse(flags, 0, 0, data);
+    }
+
+    pub fn wheel(&self, vertical: i16, horizontal: i16) {
+        if vertical != 0 {
+            send_mouse(MOUSEEVENTF_WHEEL, 0, 0, vertical as i32 as u32);
+        }
+        if horizontal != 0 {
+            send_mouse(MOUSEEVENTF_HWHEEL, 0, 0, horizontal as i32 as u32);
+        }
+    }
+
+    /// Touche par scancode (indépendant de la disposition du clavier) ; 0xE0xx = touche étendue.
+    pub fn key(&self, scancode: u16, down: bool) {
+        let mut flags = KEYEVENTF_SCANCODE;
+        if scancode & 0xFF00 == 0xE000 {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if !down {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0), wScan: scancode & 0xFF, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        };
+        unsafe {
+            SendInput(&[input], size_of::<INPUT>() as i32);
+        }
+    }
+}
+
+fn send_mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) {
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    };
+    unsafe {
+        SendInput(&[input], size_of::<INPUT>() as i32);
     }
 }

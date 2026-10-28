@@ -29,4 +29,9 @@ Dans la fenêtre PiP :
   - flèches haut / bas    -> opacité au survol
   - Ctrl+Q                -> fermer la fenêtre
 
+Contrôle à distance (souris et clavier de l'autre PC) :
+  - sur la source : cocher « Autoriser l'autre PC à piloter… » et noter le code
+  - sur le viewer : saisir ce code dans la connexion (Modifier)
+  - dans la fenêtre PiP : Ctrl+Alt+K pour prendre / rendre la main
+
 Fermer l'interface arrête aussi les fenêtres PiP et le partage lancés depuis elle.

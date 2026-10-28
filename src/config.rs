@@ -25,11 +25,13 @@ pub struct Connection {
     pub name: String,
     pub host: String,
     pub port: u16,
+    /// Code de contrôle de la source (vide = affichage seul).
+    pub code: String,
 }
 
 impl Default for Connection {
     fn default() -> Self {
-        Self { name: String::new(), host: String::new(), port: DEFAULT_PORT }
+        Self { name: String::new(), host: String::new(), port: DEFAULT_PORT, code: String::new() }
     }
 }
 
@@ -51,11 +53,15 @@ pub struct SendConfig {
     pub show_cursor: bool,
     /// Mode d'encodage « texte » : plus net sur du texte fixe mais ~3× plus lent.
     pub sharp_text: bool,
+    /// Autorise un viewer à piloter la souris et le clavier de ce PC (fonction KVM).
+    pub allow_control: bool,
+    /// Code à 6 chiffres que le viewer doit connaître pour prendre le contrôle.
+    pub control_code: String,
 }
 
 impl Default for SendConfig {
     fn default() -> Self {
-        Self { port: DEFAULT_PORT, monitor: 0, fps: 60, bitrate_mbps: 20, downscale: 0, show_cursor: true, sharp_text: false }
+        Self { port: DEFAULT_PORT, monitor: 0, fps: 60, bitrate_mbps: 20, downscale: 0, show_cursor: true, sharp_text: false, allow_control: false, control_code: String::new() }
     }
 }
 
@@ -83,6 +89,9 @@ pub struct ViewConfig {
     pub height: u32,
     /// Position initiale : "pip" (coin bas-droit), "pbp-left", "pbp-right" ou "free".
     pub layout: String,
+    /// Code de contrôle de la source (variable d'environnement PIP_CODE, jamais enregistré ici).
+    #[serde(skip)]
+    pub control_code: String,
     /// Fraction de la largeur de l'écran utilisée en mode PiP.
     pub pip_scale: f32,
 }
@@ -101,6 +110,7 @@ impl Default for ViewConfig {
             width: 960,
             height: 540,
             layout: "pip".into(),
+            control_code: String::new(),
             pip_scale: 0.3,
         }
     }
@@ -123,6 +133,9 @@ pub struct SendArgs {
     /// Encodage optimisé pour le texte (plus lent)
     #[arg(long)]
     pub sharp_text: bool,
+    /// Autorise le contrôle à distance (souris et clavier) avec un code
+    #[arg(long)]
+    pub allow_control: bool,
 }
 
 #[derive(Debug, Args)]
@@ -154,6 +167,8 @@ impl SendConfig {
         if let Some(v) = a.downscale { self.downscale = v; }
         if a.no_cursor { self.show_cursor = false; }
         if a.sharp_text { self.sharp_text = true; }
+        if a.allow_control { self.allow_control = true; }
+        if let Ok(code) = std::env::var("PIP_CODE") { self.control_code = code; }
         self.fps = self.fps.clamp(1, 240);
         self.downscale = self.downscale.min(4);
         self
@@ -168,6 +183,7 @@ impl ViewConfig {
         if let Some(v) = a.opacity { self.opacity = v; }
         if let Some(v) = a.layout { self.layout = v; }
         if a.no_click_through { self.click_through_on_hover = false; }
+        if let Ok(code) = std::env::var("PIP_CODE") { self.control_code = code; }
         self.opacity = self.opacity.clamp(0.05, 1.0);
         self.hover_opacity = self.hover_opacity.clamp(0.0, 1.0);
         self.pip_scale = self.pip_scale.clamp(0.05, 1.0);

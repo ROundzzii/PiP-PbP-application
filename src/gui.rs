@@ -20,6 +20,7 @@ use eframe::egui::{self, Color32, RichText};
 use crate::capture;
 use crate::config::{self, Connection, FileConfig};
 use crate::discovery;
+use crate::protocol;
 use crate::win;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -90,6 +91,7 @@ struct Gui {
 
     tab: Tab,
     quick_host: String,
+    quick_code: String,
     new_conn: Connection,
     editing: Option<usize>,
 
@@ -118,6 +120,7 @@ impl Gui {
             save_error: None,
             tab: Tab::Connections,
             quick_host: String::new(),
+            quick_code: String::new(),
             new_conn: Connection::default(),
             editing: None,
             search: None,
@@ -157,11 +160,15 @@ impl Gui {
         }
     }
 
-    fn spawn(&mut self, ctx: &egui::Context, kind: Kind, label: String, args: &[String]) {
+    fn spawn(&mut self, ctx: &egui::Context, kind: Kind, label: String, args: &[String], code: &str) {
         self.autosave(true);
         let exe = std::env::current_exe().unwrap_or_else(|_| "pip-pbp.exe".into());
         let mut cmd = Command::new(exe);
         cmd.arg("--config").arg(&self.path).args(args);
+        cmd.env_remove("PIP_CODE");
+        if !code.trim().is_empty() {
+            cmd.env("PIP_CODE", code.trim());
+        }
         cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
         cmd.creation_flags(CREATE_NO_WINDOW);
 
@@ -191,9 +198,9 @@ impl Gui {
         }
     }
 
-    fn connect(&mut self, ctx: &egui::Context, label: &str, host: &str, port: u16) {
+    fn connect(&mut self, ctx: &egui::Context, label: &str, host: &str, port: u16, code: &str) {
         let args = vec!["view".into(), host.trim().to_string(), "--port".into(), port.to_string()];
-        self.spawn(ctx, Kind::View, format!("Affichage de {label}"), &args);
+        self.spawn(ctx, Kind::View, format!("Affichage de {label}"), &args, code);
     }
 
     fn sharing(&self) -> bool {
@@ -268,10 +275,10 @@ impl Gui {
         }
         if let Some((name, host, save)) = action {
             if save {
-                self.cfg.connections.push(Connection { name, host, port: self.cfg.view.port });
+                self.cfg.connections.push(Connection { name, host, port: self.cfg.view.port, code: String::new() });
             } else {
                 let port = self.cfg.view.port;
-                self.connect(&ctx, &name, &host, port);
+                self.connect(&ctx, &name, &host, port, "");
             }
         }
 
@@ -282,12 +289,14 @@ impl Gui {
         }
         let mut remove = None;
         let mut connect = None;
-        egui::Grid::new("connections").num_columns(4).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
+        egui::Grid::new("connections").num_columns(5).spacing([12.0, 6.0]).striped(true).show(ui, |ui| {
             for (i, c) in self.cfg.connections.iter_mut().enumerate() {
                 if self.editing == Some(i) {
-                    ui.add(egui::TextEdit::singleline(&mut c.name).hint_text("Nom").desired_width(140.0));
-                    ui.add(egui::TextEdit::singleline(&mut c.host).hint_text("Adresse IP").desired_width(140.0));
+                    ui.add(egui::TextEdit::singleline(&mut c.name).hint_text("Nom").desired_width(130.0));
+                    ui.add(egui::TextEdit::singleline(&mut c.host).hint_text("Adresse IP").desired_width(130.0));
                     ui.add(egui::DragValue::new(&mut c.port).range(1..=65535));
+                    ui.add(egui::TextEdit::singleline(&mut c.code).hint_text("Code contrôle").password(true).desired_width(100.0))
+                        .on_hover_text("Code affiché sur l'autre PC (onglet Partager cet écran). Vide = affichage seul.");
                     if ui.button("✔ OK").clicked() {
                         self.editing = None;
                     }
@@ -295,6 +304,8 @@ impl Gui {
                     ui.label(RichText::new(&c.name).strong());
                     ui.label(&c.host);
                     ui.label(c.port.to_string());
+                    ui.label(if c.code.trim().is_empty() { RichText::new("affichage seul").weak() } else { RichText::new("🖱 contrôle") })
+                        .on_hover_text("Avec un code : Ctrl+Alt+K dans la fenêtre PiP pour piloter l'autre PC");
                     ui.horizontal(|ui| {
                         if ui.button("▶ Afficher").clicked() {
                             connect = Some(c.clone());
@@ -316,7 +327,7 @@ impl Gui {
         }
         if let Some(c) = connect {
             let label = if c.name.is_empty() { c.host.clone() } else { c.name.clone() };
-            self.connect(&ctx, &label, &c.host, c.port);
+            self.connect(&ctx, &label, &c.host, c.port, &c.code);
         }
 
         ui.add_space(12.0);
@@ -326,6 +337,8 @@ impl Gui {
             ui.add(egui::TextEdit::singleline(&mut self.new_conn.host).hint_text("Adresse IP").desired_width(150.0));
             ui.label("Port");
             ui.add(egui::DragValue::new(&mut self.new_conn.port).range(1..=65535));
+            ui.add(egui::TextEdit::singleline(&mut self.new_conn.code).hint_text("Code (option)").password(true).desired_width(100.0))
+                .on_hover_text("Code de contrôle affiché sur l'autre PC. Vide = affichage seul.");
             let valid = !self.new_conn.host.trim().is_empty();
             if ui.add_enabled(valid, egui::Button::new("+ Enregistrer")).clicked() {
                 let mut c = std::mem::take(&mut self.new_conn);
@@ -342,14 +355,16 @@ impl Gui {
         section(ui, "Connexion rapide");
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.quick_host).hint_text("Adresse IP").desired_width(150.0));
+            ui.add(egui::TextEdit::singleline(&mut self.quick_code).hint_text("Code (option)").password(true).desired_width(100.0));
             let host = self.quick_host.trim().to_string();
+            let code = self.quick_code.clone();
             if ui.add_enabled(!host.is_empty(), egui::Button::new("▶ Afficher")).clicked() {
                 let port = self.cfg.view.port;
-                self.connect(&ctx, &host, &host, port);
+                self.connect(&ctx, &host, &host, port, &code);
             }
             if ui.button("▶ Détection automatique").on_hover_text("Se connecte à la première source trouvée").clicked() {
                 let port = self.cfg.view.port;
-                self.connect(&ctx, "la source détectée", "auto", port);
+                self.connect(&ctx, "la source détectée", "auto", port, &code);
             }
         });
     }
@@ -372,7 +387,10 @@ impl Gui {
                 }
                 ui.label(RichText::new("● Partage actif").color(Color32::from_rgb(80, 200, 120)));
             } else if ui.add(egui::Button::new(RichText::new("▶ Démarrer le partage").strong()).fill(Color32::from_rgb(40, 110, 60))).clicked() {
-                self.spawn(&ctx, Kind::Send, "Partage de cet écran".into(), &["send".into()]);
+                if self.cfg.send.allow_control && self.cfg.send.control_code.trim().len() < 4 {
+                    self.cfg.send.control_code = protocol::new_code();
+                }
+                self.spawn(&ctx, Kind::Send, "Partage de cet écran".into(), &["send".into()], "");
             }
         });
         ui.add_space(8.0);
@@ -407,6 +425,35 @@ impl Gui {
                 }
             }
         });
+
+        ui.add_space(12.0);
+        section(ui, "Contrôle à distance (KVM)");
+        ui.add_enabled_ui(!running, |ui| {
+            let s = &mut self.cfg.send;
+            if ui
+                .checkbox(&mut s.allow_control, "Autoriser l'autre PC à piloter la souris et le clavier de ce PC")
+                .changed()
+                && s.allow_control
+                && s.control_code.trim().len() < 4
+            {
+                s.control_code = protocol::new_code();
+            }
+        });
+        if self.cfg.send.allow_control {
+            ui.horizontal(|ui| {
+                ui.label("Code à saisir sur l'autre PC :");
+                ui.label(RichText::new(&self.cfg.send.control_code).monospace().size(22.0).strong().color(Color32::from_rgb(255, 160, 60)));
+                if ui.add_enabled(!running, egui::Button::new("Nouveau code")).clicked() {
+                    self.cfg.send.control_code = protocol::new_code();
+                }
+            });
+            ui.label(
+                RichText::new("Sur l'autre PC : enregistrez ce code dans la connexion, puis Ctrl+Alt+K dans la fenêtre PiP pour prendre ou rendre la main.")
+                    .weak(),
+            );
+        } else {
+            ui.label(RichText::new("Désactivé : l'autre PC peut seulement voir cet écran.").weak());
+        }
 
         ui.add_space(12.0);
         section(ui, "Adresses de ce PC");
@@ -539,6 +586,7 @@ impl Gui {
                 ("1 / 2 / 3", "PiP coin / PbP gauche / PbP droite"),
                 ("↑ / ↓", "Opacité au survol ±5 %"),
                 ("C / T / A", "Clic à travers / premier plan / ratio"),
+                ("Ctrl+Alt+K", "Contrôle de l'autre PC (KVM) : prendre / rendre la main"),
                 ("Ctrl+Q", "Fermer la fenêtre"),
             ] {
                 ui.monospace(k);

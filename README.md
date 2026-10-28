@@ -130,7 +130,31 @@ pip-pbp bench --monitor 1
 | **T** | Toujours au premier plan on/off |
 | **A** | Garder le ratio on/off |
 | **Échap** | Quitter le plein écran |
+| **Ctrl+Alt+K** | Contrôle de l'autre PC (KVM) : prendre / rendre la main |
 | **Ctrl+Q** | Quitter |
+
+## Contrôle à distance (KVM)
+
+La fenêtre PiP peut aussi piloter la souris et le clavier de l'autre PC.
+
+1. Sur le PC source, onglet *Partager cet écran* : cocher **« Autoriser l'autre PC à
+   piloter la souris et le clavier »** (désactivé par défaut). Un **code à 6 chiffres**
+   s'affiche, puis démarrer le partage.
+2. Sur le PC viewer, onglet *Connexions* : saisir ce code dans la connexion
+   (bouton *Modifier*), puis l'afficher.
+3. Dans la fenêtre PiP, **Ctrl+Alt+K** prend la main : liseré orange, la souris reste
+   dans la fenêtre et pilote l'autre PC. **Ctrl+Alt+K** à nouveau rend la main.
+
+Sécurité : le code n'est jamais envoyé en clair (preuve HMAC-SHA256 sur un nombre
+aléatoire différent à chaque connexion), 5 essais faux coupent la connexion, et les
+entrées sont ignorées tant que le code n'est pas validé. À la sortie du mode contrôle
+(ou si la fenêtre perd le focus), toutes les touches et boutons enfoncés sont relâchés
+sur l'autre PC. Le flux n'est pas chiffré : à utiliser sur un réseau de confiance ou
+à travers un VPN.
+
+Limites : les écrans protégés de Windows (demandes UAC, écran de verrouillage,
+Ctrl+Alt+Suppr) ne peuvent pas être pilotés, et Alt+Tab / la touche Windows restent
+captés par le PC local.
 
 ## Configuration
 

@@ -81,6 +81,8 @@ pub struct Capturer {
     staging: Option<ID3D11Texture2D>,
     pub width: usize,
     pub height: usize,
+    /// Position et taille de l'écran capturé sur le bureau (x, y, largeur, hauteur).
+    pub monitor_rect: (i32, i32, i32, i32),
     /// Image du bureau sans le curseur (BGRA, `width * 4` octets par ligne).
     clean: Vec<u8>,
     /// Image envoyée : bureau + curseur.
@@ -98,7 +100,9 @@ impl Capturer {
         };
         eprintln!("Capture de l'écran {mon}");
         let (device, context, dupl) = unsafe { Self::open(&mon)? };
+        let monitor_rect = (mon.x, mon.y, mon.width, mon.height);
         let mut c = Self {
+            monitor_rect,
             monitor_index,
             device,
             context,
@@ -155,6 +159,7 @@ impl Capturer {
         let monitors = list_monitors()?;
         let mon = monitors.into_iter().nth(self.monitor_index).context("écran disparu")?;
         let (device, context, dupl) = unsafe { Self::open(&mon)? };
+        self.monitor_rect = (mon.x, mon.y, mon.width, mon.height);
         self.device = device;
         self.context = context;
         self.dupl = dupl;

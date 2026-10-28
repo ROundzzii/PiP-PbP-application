@@ -1,8 +1,8 @@
 //! Côté source : capture -> conversion YUV -> H.264 -> TCP.
 
-use std::io::{BufWriter, Read};
+use std::io::BufWriter;
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -16,14 +16,30 @@ use openh264::encoder::{
 use crate::capture::{Capturer, FrameStatus};
 use crate::config::SendConfig;
 use crate::discovery;
-use crate::protocol::{self, MAGIC, MSG_REPLACED, MSG_VIDEO, REQ_KEYFRAME};
+use crate::protocol::{
+    self, IN_KEY, IN_MOUSE_BUTTON, IN_MOUSE_MOVE, IN_WHEEL, MAGIC, MSG_AUTH, MSG_HELLO, MSG_REPLACED, MSG_VIDEO,
+    REQ_AUTH, REQ_KEYFRAME,
+};
+use crate::win::{self, Injector};
 use crate::yuv::I420;
 
 /// Nombre max de paquets en attente d'envoi. Au-delà, on saute des images plutôt que
 /// d'accumuler du retard dans les buffers TCP : la latence reste constante.
 const MAX_IN_FLIGHT: usize = 2;
+/// Essais de code faux tolérés par connexion avant de la couper.
+const MAX_AUTH_FAILURES: u32 = 5;
 
-pub fn run(cfg: SendConfig) -> anyhow::Result<()> {
+pub fn run(mut cfg: SendConfig) -> anyhow::Result<()> {
+    // Pixels physiques partout : capture, et positions de souris du contrôle à distance.
+    win::make_dpi_aware();
+    if cfg.allow_control {
+        if cfg.control_code.trim().len() < 4 {
+            cfg.control_code = protocol::new_code();
+        }
+        eprintln!("Contrôle à distance AUTORISÉ, code : {}", cfg.control_code);
+    } else {
+        eprintln!("Contrôle à distance désactivé (affichage seul).");
+    }
     let listener = TcpListener::bind(("0.0.0.0", cfg.port)).with_context(|| format!("écoute sur le port {}", cfg.port))?;
     discovery::spawn_responder(cfg.port);
     eprintln!("En attente d'un viewer sur le port {} (Ctrl+C pour quitter).", cfg.port);
@@ -78,26 +94,18 @@ fn stream_to(
     stream.set_nodelay(true)?;
     let mut reader = stream.try_clone()?;
     let reader_shutdown = stream.try_clone()?;
-    let mut writer = BufWriter::with_capacity(1 << 20, stream);
-    std::io::Write::write_all(&mut writer, MAGIC)?;
+    let mut out = BufWriter::with_capacity(1 << 20, stream);
+    std::io::Write::write_all(&mut out, MAGIC)?;
+    // HELLO : contrôle autorisé ? + nombre aléatoire pour la preuve du code.
+    let nonce = protocol::new_nonce();
+    let mut hello = vec![u8::from(cfg.allow_control)];
+    hello.extend_from_slice(&nonce);
+    protocol::write_packet(&mut out, MSG_HELLO, &hello)?;
+    // Écriture partagée : vidéo (thread réseau) et réponses au code (thread de lecture).
+    let writer = Arc::new(Mutex::new(out));
 
     let keyframe_requested = Arc::new(AtomicBool::new(true));
     let alive = Arc::new(AtomicBool::new(true));
-
-    // Lecture des requêtes du viewer.
-    {
-        let keyframe_requested = keyframe_requested.clone();
-        let alive = alive.clone();
-        std::thread::spawn(move || {
-            let mut b = [0u8; 1];
-            while reader.read_exact(&mut b).is_ok() {
-                if b[0] == REQ_KEYFRAME {
-                    keyframe_requested.store(true, Ordering::Relaxed);
-                }
-            }
-            alive.store(false, Ordering::Relaxed);
-        });
-    }
 
     // Envoi réseau dans un thread séparé pour que l'encodage n'attende jamais le réseau.
     let in_flight = Arc::new(AtomicUsize::new(0));
@@ -105,9 +113,10 @@ fn stream_to(
     let net = {
         let in_flight = in_flight.clone();
         let alive = alive.clone();
+        let writer = writer.clone();
         std::thread::spawn(move || {
             for packet in rx {
-                let r = protocol::write_packet(&mut writer, MSG_VIDEO, &packet);
+                let r = protocol::write_packet(&mut *writer.lock().unwrap(), MSG_VIDEO, &packet);
                 in_flight.fetch_sub(1, Ordering::Relaxed);
                 if r.is_err() {
                     alive.store(false, Ordering::Relaxed);
@@ -116,6 +125,50 @@ fn stream_to(
             }
         })
     };
+
+    // Requêtes du viewer : image clé, code de contrôle, souris et clavier.
+    {
+        let keyframe_requested = keyframe_requested.clone();
+        let alive = alive.clone();
+        let writer = writer.clone();
+        let allow = cfg.allow_control;
+        let code = cfg.control_code.clone();
+        let injector = Injector::new(capturer.monitor_rect);
+        std::thread::spawn(move || {
+            let mut authed = false;
+            let mut failures = 0;
+            while let Ok((kind, p)) = protocol::read_request(&mut reader) {
+                match kind {
+                    REQ_KEYFRAME => keyframe_requested.store(true, Ordering::Relaxed),
+                    REQ_AUTH => {
+                        authed = allow && protocol::check_auth(&code, &nonce, &p);
+                        let _ = protocol::write_packet(&mut *writer.lock().unwrap(), MSG_AUTH, &[u8::from(authed)]);
+                        if authed {
+                            eprintln!("Contrôle à distance : code accepté");
+                        } else if allow {
+                            failures += 1;
+                            eprintln!("Contrôle à distance : code refusé ({failures}/{MAX_AUTH_FAILURES})");
+                            if failures >= MAX_AUTH_FAILURES {
+                                break;
+                            }
+                        }
+                    }
+                    // Les entrées ne sont appliquées qu'après validation du code.
+                    _ if !authed => {}
+                    IN_MOUSE_MOVE if p.len() == 4 => {
+                        injector.move_to(u16::from_le_bytes([p[0], p[1]]), u16::from_le_bytes([p[2], p[3]]))
+                    }
+                    IN_MOUSE_BUTTON if p.len() == 2 => injector.button(p[0], p[1] != 0),
+                    IN_WHEEL if p.len() == 4 => {
+                        injector.wheel(i16::from_le_bytes([p[0], p[1]]), i16::from_le_bytes([p[2], p[3]]))
+                    }
+                    IN_KEY if p.len() == 3 => injector.key(u16::from_le_bytes([p[0], p[1]]), p[2] != 0),
+                    _ => {}
+                }
+            }
+            alive.store(false, Ordering::Relaxed);
+        });
+    }
 
     let mut encoder = Encoder::with_api_config(OpenH264API::from_source(), encoder_config(cfg))?;
 
@@ -172,7 +225,7 @@ fn stream_to(
     let _ = net.join();
     // Prévient l'ancien viewer qu'il est remplacé (il se ferme au lieu de se reconnecter).
     if replaced_by.is_some() {
-        let _ = protocol::write_packet(&mut &reader_shutdown, MSG_REPLACED, &[]);
+        let _ = protocol::write_packet(&mut *writer.lock().unwrap(), MSG_REPLACED, &[]);
     }
     let _ = reader_shutdown.shutdown(std::net::Shutdown::Both);
     Ok(replaced_by)
