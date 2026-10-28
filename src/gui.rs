@@ -21,6 +21,7 @@ use crate::capture;
 use crate::config::{self, Connection, FileConfig};
 use crate::discovery;
 use crate::protocol;
+use crate::shortcuts::{Action, Shortcut, Shortcuts};
 use crate::win;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -52,6 +53,7 @@ enum Tab {
     Connections,
     Share,
     Display,
+    Shortcuts,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -103,6 +105,10 @@ struct Gui {
     firewall: Option<Receiver<Result<(), String>>>,
     firewall_status: Option<Result<(), String>>,
 
+    /// Action dont on enregistre le nouveau raccourci (page Raccourcis).
+    recording: Option<Action>,
+    shortcut_error: Option<String>,
+
     monitors: Vec<String>,
     local_ips: Vec<(String, String)>,
     sessions: Vec<Session>,
@@ -128,6 +134,8 @@ impl Gui {
             searched: false,
             firewall: None,
             firewall_status: None,
+            recording: None,
+            shortcut_error: None,
             monitors: Vec::new(),
             local_ips: Vec::new(),
             sessions: Vec::new(),
@@ -577,28 +585,169 @@ impl Gui {
         });
 
         ui.add_space(12.0);
-        section(ui, "Raccourcis dans la fenêtre");
-        egui::Grid::new("keys").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+        section(ui, "Raccourcis et menu");
+        ui.horizontal(|ui| {
+            ui.label("Alt + clic droit sur la fenêtre PiP : menu des options. Raccourcis clavier modifiables :");
+            if ui.link("onglet Raccourcis").clicked() {
+                self.tab = Tab::Shortcuts;
+            }
+        });
+
+        ui.add_space(12.0);
+        if ui.button("Réinitialiser les réglages d'affichage").clicked() {
+            // Les raccourcis ont leur propre bouton de réinitialisation.
+            let shortcuts = std::mem::take(&mut self.cfg.view.shortcuts);
+            self.cfg.view = config::ViewConfig::default();
+            self.cfg.view.shortcuts = shortcuts;
+        }
+    }
+
+    // ----- Onglet Raccourcis -------------------------------------------------------
+
+    /// Enregistre la touche pressée pour l'action en attente (`recording`).
+    fn capture_shortcut(&mut self, ui: &mut egui::Ui) {
+        let Some(action) = self.recording else { return };
+        let pressed = ui.input_mut(|i| {
+            let found = i.events.iter().find_map(|e| match e {
+                egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } => {
+                    Some((physical_key.unwrap_or(*key), *modifiers))
+                }
+                _ => None,
+            });
+            // Les touches ne doivent pas agir sur l'interface pendant l'enregistrement (Tab, Entrée…).
+            if found.is_some() {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)));
+            }
+            found
+        });
+        let Some((key, mods)) = pressed else { return };
+        if key == egui::Key::Escape && !mods.any() {
+            self.recording = None;
+            return;
+        }
+        let Some(sc) = Shortcut::from_egui(key, mods) else {
+            self.shortcut_error = Some(format!("La touche « {key:?} » ne peut pas servir de raccourci."));
+            return;
+        };
+        if action.is_global() && !(sc.ctrl || sc.alt) {
+            self.shortcut_error = Some(
+                "Le raccourci de contrôle agit sur tout le PC : il doit contenir Ctrl ou Alt.".to_string(),
+            );
+            return;
+        }
+        if sc.vk().is_none() && action.is_global() {
+            self.shortcut_error = Some("Cette touche ne peut pas servir de raccourci global.".to_string());
+            return;
+        }
+        // Fenêtre PiP : Alt est implicite (on tient Alt, curseur sur la fenêtre).
+        let sc = if action.is_global() { sc } else { sc.without_alt() };
+        self.set_shortcut(action, Some(sc));
+        self.recording = None;
+        self.shortcut_error = None;
+    }
+
+    /// `None` = raccourci par défaut.
+    fn set_shortcut(&mut self, action: Action, sc: Option<Shortcut>) {
+        let map = &mut self.cfg.view.shortcuts;
+        match sc {
+            Some(sc) if sc.to_string() != action.default_shortcut() => {
+                map.insert(action.id().to_string(), sc.to_string());
+            }
+            _ => {
+                map.remove(action.id());
+            }
+        }
+    }
+
+    fn shortcuts_tab(&mut self, ui: &mut egui::Ui) {
+        self.capture_shortcut(ui);
+        let current = Shortcuts::from_config(&self.cfg.view.shortcuts);
+
+        section(ui, "Raccourcis clavier de la fenêtre PiP");
+        ui.label(RichText::new("Curseur sur la fenêtre PiP, maintenez Alt puis appuyez sur la touche (Alt+A, Alt+1…). Sans Alt, aucune touche n'est captée.").weak());
+        ui.label(RichText::new("Seul le raccourci de contrôle de l'autre PC marche partout, sans Alt implicite.").weak());
+        ui.label(RichText::new("Pour changer un raccourci : cliquez dessus puis appuyez sur la nouvelle touche, Alt n'est pas nécessaire (Échap pour annuler). Appliqué à la prochaine fenêtre PiP ouverte.").weak());
+        if let Some(e) = &self.shortcut_error {
+            ui.label(RichText::new(format!("✖ {e}")).color(Color32::LIGHT_RED));
+        }
+        ui.add_space(6.0);
+
+        let mut start = None;
+        let mut reset = None;
+        egui::Grid::new("shortcuts").num_columns(3).spacing([16.0, 6.0]).striped(true).show(ui, |ui| {
+            for action in Action::ALL {
+                let sc = current.get(action);
+                ui.label(action.label());
+                let recording = self.recording == Some(action);
+                let text = if recording {
+                    RichText::new("Appuyez sur une touche…").color(Color32::from_rgb(255, 160, 60))
+                } else {
+                    RichText::new(sc.display_for(action)).monospace().strong()
+                };
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(text).min_size(egui::vec2(150.0, 0.0))).clicked() {
+                        start = Some(action);
+                    }
+                    // Doublon : une même combinaison pour deux actions.
+                    // Alt implicite pour la fenêtre PiP : on compare sans Alt, sauf pour le
+                    // raccourci global (Ctrl+Alt+K) qui n'entre pas en conflit avec eux.
+                    let key = |a: Action| if a.is_global() { current.get(a).clone() } else { current.get(a).without_alt() };
+                    let twins: Vec<&str> = Action::ALL
+                        .iter()
+                        .filter(|&&a| a != action && a.is_global() == action.is_global() && key(a) == key(action))
+                        .map(|a| a.label())
+                        .collect();
+                    if !twins.is_empty() {
+                        ui.label(RichText::new(format!("⚠ même raccourci que : {}", twins.join(", "))).color(Color32::LIGHT_RED));
+                    }
+                });
+                let is_default = if action.is_global() {
+                    sc.to_string() == action.default_shortcut()
+                } else {
+                    sc.without_alt().to_string() == action.default_shortcut()
+                };
+                if ui.add_enabled(!is_default, egui::Button::new("Par défaut").small()).clicked() {
+                    reset = Some(action);
+                }
+                ui.end_row();
+            }
+        });
+        if let Some(a) = start {
+            self.recording = Some(a);
+            self.shortcut_error = None;
+        }
+        if let Some(a) = reset {
+            self.set_shortcut(a, None);
+        }
+        ui.add_space(8.0);
+        if ui.add_enabled(!self.cfg.view.shortcuts.is_empty(), egui::Button::new("Tout remettre par défaut")).clicked() {
+            self.cfg.view.shortcuts.clear();
+            self.recording = None;
+        }
+        if self.recording.is_some_and(Action::is_global) {
+            ui.label(
+                RichText::new("Astuce : si une fenêtre PiP est ouverte, elle intercepte son raccourci de contrôle actuel ; fermez-la pour le redéfinir.")
+                    .weak(),
+            );
+        }
+
+        ui.add_space(12.0);
+        section(ui, "Souris (non modifiable)");
+        egui::Grid::new("mouse").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
             for (k, d) in [
-                ("Alt maintenu", "Fenêtre opaque et cliquable (déplacer / redimensionner)"),
+                ("Alt maintenu", "Fenêtre opaque et cliquable (déplacer / redimensionner), raccourcis Alt+touche"),
+                ("Alt + clic droit", "Menu des options, ouvert tant qu'Alt reste enfoncé (sans Alt, le clic passe derrière)"),
+                ("Alt + glisser", "Déplacer la fenêtre"),
+                ("Alt + glisser un bord", "Redimensionner (proportionnel sauf en étirement libre)"),
                 ("Molette", "Agrandir / réduire"),
-                ("Double-clic, F, F11", "Plein écran"),
-                ("1 / 2 / 3", "PiP coin / PbP gauche / PbP droite"),
-                ("↑ / ↓", "Opacité au survol ±5 %"),
-                ("C / T / A", "Clic à travers / premier plan / ratio"),
-                ("Ctrl+Alt+K", "Contrôle de l'autre PC (KVM) : prendre / rendre la main"),
-                ("Ctrl+Q", "Fermer la fenêtre"),
+                ("Double-clic", "Plein écran / fenêtré"),
+                ("Échap", "Quitter le plein écran"),
             ] {
                 ui.monospace(k);
                 ui.label(d);
                 ui.end_row();
             }
         });
-
-        ui.add_space(12.0);
-        if ui.button("Réinitialiser les réglages d'affichage").clicked() {
-            self.cfg.view = config::ViewConfig::default();
-        }
     }
 
     fn sessions_panel(&mut self, ui: &mut egui::Ui) {
@@ -655,6 +804,7 @@ impl eframe::App for Gui {
                 ui.selectable_value(&mut self.tab, Tab::Connections, "Connexions");
                 ui.selectable_value(&mut self.tab, Tab::Share, "Partager cet écran");
                 ui.selectable_value(&mut self.tab, Tab::Display, "Réglages d'affichage");
+                ui.selectable_value(&mut self.tab, Tab::Shortcuts, "Raccourcis");
             });
             ui.add_space(4.0);
         });
@@ -677,6 +827,7 @@ impl eframe::App for Gui {
                 Tab::Connections => self.connections_tab(ui),
                 Tab::Share => self.share_tab(ui),
                 Tab::Display => self.display_tab(ui),
+                Tab::Shortcuts => self.shortcuts_tab(ui),
             });
         });
 

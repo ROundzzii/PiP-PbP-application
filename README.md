@@ -68,6 +68,9 @@ Double-cliquer sur `pip-pbp.exe` (ou le lancer sans argument) ouvre l'interface 
   débit, résolution, curseur ; affiche les adresses IP de ce PC.
 - **Réglages d'affichage** : opacité normale et au survol, clic à travers, premier
   plan, ratio, disposition PiP / PbP au démarrage, taille.
+- **Raccourcis** : tous les raccourcis de la fenêtre PiP sont modifiables (cliquer
+  puis appuyer sur la nouvelle combinaison). Les touches sont reconnues par leur
+  position sur le clavier (AZERTY comme QWERTY).
 - **Sessions** : fenêtres PiP et partage en cours, avec leur journal et un bouton Arrêter.
 
 Les réglages et connexions sont enregistrés automatiquement dans
@@ -115,23 +118,33 @@ pip-pbp bench --monitor 1
 
 ### Souris et clavier dans la fenêtre
 
+**Alt est la touche d'interaction** : curseur sur la fenêtre PiP et Alt maintenu,
+la fenêtre devient opaque et cliquable, les raccourcis Alt+touche fonctionnent et
+**Alt + clic droit** ouvre le menu de toutes les options (il se ferme au
+relâchement d'Alt). Sans Alt, rien n'est capté : les clics et les touches vont à la
+fenêtre derrière. Seul le raccourci de contrôle (Ctrl+Alt+K) marche partout.
+
+Raccourcis par défaut, modifiables dans l'onglet *Raccourcis*. Les actions dont
+l'effet ne se voit pas tout de suite affichent une petite notification.
+
 | Action | Effet |
 |---|---|
 | Survol | Fenêtre transparente (`hover_opacity`) et clics traversants |
-| **Alt** maintenu | Fenêtre opaque et interactive (pour la déplacer / redimensionner) |
-| Glisser | Déplacer la fenêtre |
-| Glisser un bord / coin | Redimensionner |
-| Molette | Agrandir / réduire en gardant le ratio |
-| Double-clic, **F**, **F11** | Plein écran / fenêtré |
-| **1** / **2** / **3** | PiP coin bas-droit / PbP gauche / PbP droite |
-| **↑** / **↓** | Opacité au survol ±5 % |
-| **Page↑** / **Page↓** | Opacité normale ±5 % |
-| **C** | Active / désactive le clic à travers |
-| **T** | Toujours au premier plan on/off |
-| **A** | Garder le ratio on/off |
+| **Alt** maintenu | Fenêtre opaque et interactive (déplacer / redimensionner) |
+| Alt + glisser | Déplacer la fenêtre |
+| Alt + glisser un bord / coin | Redimensionner (proportionnel sauf en étirement libre) |
+| Alt + molette | Agrandir / réduire en gardant le ratio |
+| Alt + double-clic, **Alt+F11** | Plein écran / fenêtré |
+| **Alt+1** / **Alt+2** / **Alt+3** | PiP coin bas-droit / PbP gauche / PbP droite |
+| **Alt+↑** / **Alt+↓** | Opacité au survol ±5 % |
+| **Alt+Page↑** / **Alt+Page↓** | Opacité normale ±5 % |
+| **Alt+C** | Clic à travers on/off |
+| **Alt+T** | Toujours au premier plan on/off |
+| **Alt+A** | Étirement libre on/off |
+| **Alt + clic droit** | Menu des options |
 | **Échap** | Quitter le plein écran |
 | **Ctrl+Alt+K** | Contrôle de l'autre PC (KVM) : prendre / rendre la main |
-| **Ctrl+Q** | Quitter |
+| **Alt+Q** | Fermer la fenêtre PiP |
 
 ## Contrôle à distance (KVM)
 

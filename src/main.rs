@@ -13,6 +13,7 @@ mod osd;
 mod protocol;
 mod render;
 mod sender;
+mod shortcuts;
 mod viewer;
 mod win;
 mod yuv;

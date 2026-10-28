@@ -8,7 +8,7 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -73,10 +73,21 @@ impl Hwnd {
         crate::osd::show(r, scale.max(1.0), text);
     }
 
-    /// Raccourci global Ctrl+Alt+K (mode contrôle), reçu même quand la fenêtre n'a pas
-    /// le focus. Nécessite `follow_suggested_dpi_rect` (même sous-classement de fenêtre).
-    pub fn register_control_hotkey(self) -> bool {
-        unsafe { RegisterHotKey(Some(self.0), HOTKEY_CONTROL_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, u32::from(b'K')).is_ok() }
+    /// Raccourci global de secours, si le hook clavier n'a pas pu être installé.
+    /// Nécessite `follow_suggested_dpi_rect` (même sous-classement de fenêtre).
+    pub fn register_control_hotkey(self, sc: &crate::shortcuts::Shortcut) -> bool {
+        let Some(vk) = sc.vk() else { return false };
+        let mut flags = MOD_NOREPEAT;
+        if sc.ctrl {
+            flags |= MOD_CONTROL;
+        }
+        if sc.alt {
+            flags |= MOD_ALT;
+        }
+        if sc.shift {
+            flags |= MOD_SHIFT;
+        }
+        unsafe { RegisterHotKey(Some(self.0), HOTKEY_CONTROL_ID, flags, vk).is_ok() }
     }
 
     /// Zone de travail (écran moins la barre des tâches) de l'écran qui contient la fenêtre.
@@ -157,6 +168,11 @@ unsafe extern "system" fn dpi_subclass_proc(
     _data: usize,
 ) -> LRESULT {
     unsafe {
+        // Relâcher Alt sur la fenêtre active le menu système invisible, qui avale la touche
+        // suivante : Alt sert ici à reprendre la main sur la fenêtre, pas aux menus.
+        if msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU {
+            return LRESULT(0);
+        }
         if msg == WM_SIZING {
             let result = DefSubclassProc(hwnd, msg, wparam, lparam);
             let aspect = f64::from_bits(RESIZE_ASPECT.load(Ordering::Relaxed));
@@ -196,6 +212,127 @@ unsafe extern "system" fn dpi_subclass_proc(
 }
 
 const HOTKEY_CONTROL_ID: i32 = 0x5050;
+
+/// Élément du menu du clic droit.
+pub enum MenuItem {
+    Item { id: u32, label: String, checked: bool },
+    Submenu { label: String, items: Vec<MenuItem> },
+    Separator,
+}
+
+unsafe fn build_menu(items: &[MenuItem]) -> Option<HMENU> {
+    unsafe {
+        let menu = CreatePopupMenu().ok()?;
+        for it in items {
+            match it {
+                MenuItem::Item { id, label, checked } => {
+                    let text: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+                    let mut flags = MF_STRING;
+                    if *checked {
+                        flags |= MF_CHECKED;
+                    }
+                    let _ = AppendMenuW(menu, flags, *id as usize, windows::core::PCWSTR(text.as_ptr()));
+                }
+                MenuItem::Submenu { label, items } => {
+                    let Some(sub) = build_menu(items) else { continue };
+                    let text: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+                    let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, windows::core::PCWSTR(text.as_ptr()));
+                }
+                MenuItem::Separator => {
+                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+                }
+            }
+        }
+        Some(menu)
+    }
+}
+
+// --- Menu du clic droit -----------------------------------------------------------------
+// Ouvert sur son propre thread, avec une petite fenêtre propriétaire invisible : la boucle
+// de la fenêtre PiP n'est jamais bloquée, et le menu peut passer au premier plan (sinon il
+// se referme aussitôt). Le choix est relevé par `take_menu_choice`.
+
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
+/// Fenêtre propriétaire du menu ouvert (pour le fermer de l'extérieur).
+static MENU_HOST: AtomicIsize = AtomicIsize::new(0);
+
+pub fn menu_open() -> bool {
+    MENU_OPEN.load(Ordering::Relaxed)
+}
+
+/// Ferme le menu ouvert (relâchement d'Alt).
+pub fn close_menu() {
+    let host = MENU_HOST.load(Ordering::Relaxed);
+    if host != 0 {
+        unsafe {
+            let _ = PostMessageW(Some(HWND(host as *mut _)), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+static MENU_CHOICE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Ouvre le menu à la position de la souris (sans effet s'il est déjà ouvert).
+pub fn open_menu(items: Vec<MenuItem>) {
+    if MENU_OPEN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::core::w;
+        let instance = GetModuleHandleW(None).ok().map(|m| windows::Win32::Foundation::HINSTANCE(m.0));
+        static REGISTER: std::sync::Once = std::sync::Once::new();
+        REGISTER.call_once(|| {
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(menu_host_proc),
+                hInstance: instance.unwrap_or_default(),
+                lpszClassName: w!("PipPbpMenuHost"),
+                ..Default::default()
+            };
+            RegisterClassW(&class);
+        });
+        let mut p = POINT::default();
+        let _ = GetCursorPos(&mut p);
+        if let Ok(host) = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            w!("PipPbpMenuHost"),
+            w!(""),
+            WS_POPUP,
+            p.x,
+            p.y,
+            1,
+            1,
+            None,
+            None,
+            instance,
+            None,
+        ) && let Some(menu) = build_menu(&items)
+        {
+            MENU_HOST.store(host.0 as isize, Ordering::Relaxed);
+            let _ = SetForegroundWindow(host);
+            let id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, p.x, p.y, None, host, None);
+            let _ = PostMessageW(Some(host), WM_NULL, WPARAM(0), LPARAM(0));
+            let _ = DestroyMenu(menu);
+            MENU_HOST.store(0, Ordering::Relaxed);
+            let _ = DestroyWindow(host);
+            if id.0 != 0 {
+                MENU_CHOICE.store(id.0 as u32, Ordering::Relaxed);
+            }
+        }
+        MENU_OPEN.store(false, Ordering::Relaxed);
+    });
+}
+
+unsafe extern "system" fn menu_host_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Choix fait dans le menu depuis le dernier appel.
+pub fn take_menu_choice() -> Option<u32> {
+    match MENU_CHOICE.swap(0, Ordering::Relaxed) {
+        0 => None,
+        id => Some(id),
+    }
+}
 
 /// Ratio largeur / hauteur imposé pendant le redimensionnement à la souris (0 = libre).
 static RESIZE_ASPECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -343,48 +480,56 @@ fn send_mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> bool {
 /// Reçoit chaque touche capturée : (scancode, enfoncée). 0xE0xx = touche étendue.
 type KeySink = Box<dyn Fn(u16, bool) + Send>;
 
+// --- Hook clavier permanent ---------------------------------------------------------------
+// Un seul hook bas niveau, sur son propre thread (Windows ne l'appelle que si son thread
+// attend des messages), avec trois rôles :
+//  - partout : reconnaître le raccourci de contrôle (Ctrl+Alt+K par défaut) ;
+//  - mode contrôle : envoyer TOUTES les touches à l'autre PC et les bloquer ici ;
+//  - curseur sur la fenêtre PiP : déclencher ses raccourcis (les autres touches passent).
+// Les touches sont reconnues par leur position (scancode), quelle que soit la disposition.
+
+/// Mode contrôle : destinataire des touches (None = pas de contrôle).
 static KEY_SINK: std::sync::Mutex<Option<KeySink>> = std::sync::Mutex::new(None);
-/// Identifiant du thread qui porte le hook clavier (0 = pas de hook).
-static KEY_HOOK_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+static KEY_HOOK_STARTED: AtomicBool = AtomicBool::new(false);
 static HOOK_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static HOOK_INJECTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Raccourci de contrôle : scancode + modificateurs (bits 1 Ctrl, 2 Alt, 4 Maj).
+static CONTROL_SC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x25);
+static CONTROL_MODS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0b011);
+/// Raccourcis de la fenêtre PiP : (scancode, modificateurs, numéro d'action, répétable).
+static PIP_SHORTCUTS: std::sync::Mutex<Vec<(u16, u8, u8, bool)>> = std::sync::Mutex::new(Vec::new());
+static PIP_HWND: AtomicIsize = AtomicIsize::new(0);
+static PIP_ON_TOP: AtomicBool = AtomicBool::new(true);
+static PIP_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+/// Actions déclenchées par le hook, relevées par la fenêtre (`take_pip_actions`).
+static PIP_ACTIONS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+/// Numéro d'action spécial : Échap en plein écran.
+pub const ACTION_EXIT_FULLSCREEN: u8 = 255;
+/// Touches enfoncées (détection des répétitions) et touches interceptées à l'appui
+/// (leur relâchement est intercepté aussi).
+static KEYS_DOWN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+static KEYS_SWALLOWED: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
 
 /// Diagnostic : touches vues par le hook depuis le début du contrôle, dont simulées.
 pub fn keyboard_hook_stats() -> (u32, u32) {
     (HOOK_SEEN.load(Ordering::Relaxed), HOOK_INJECTED.load(Ordering::Relaxed))
 }
-static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 
-/// Mode contrôle : intercepte TOUT le clavier avant Windows (touche Windows, Alt+Tab,
-/// Ctrl+Échap…), l'envoie à `sink` et l'empêche d'agir sur ce PC. Ctrl+Alt+K reste
-/// géré localement (rendre la main). Ctrl+Alt+Suppr ne peut pas être intercepté.
-///
-/// Le hook tourne sur son propre thread avec sa propre boucle de messages : Windows
-/// n'appelle un hook bas niveau que pendant que son thread attend des messages, et le
-/// supprime en silence s'il répond trop lentement (la boucle de la fenêtre ne suffit pas).
-pub fn start_keyboard_capture(sink: KeySink) -> bool {
-    *KEY_SINK.lock().unwrap() = Some(sink);
-    CTRL_DOWN.store(false, Ordering::Relaxed);
-    ALT_DOWN.store(false, Ordering::Relaxed);
-    HOOK_SEEN.store(0, Ordering::Relaxed);
-    HOOK_INJECTED.store(0, Ordering::Relaxed);
-    if KEY_HOOK_THREAD.load(Ordering::Relaxed) != 0 {
+/// Installe le hook clavier permanent pour la fenêtre PiP `window`.
+pub fn start_keyboard_hook(window: Hwnd) -> bool {
+    PIP_HWND.store(window.0.0 as isize, Ordering::Relaxed);
+    if KEY_HOOK_STARTED.load(Ordering::Relaxed) {
         return true;
     }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || unsafe {
         use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-        use windows::Win32::System::Threading::GetCurrentThreadId;
         let module = GetModuleHandleW(None).ok().map(|m| windows::Win32::Foundation::HINSTANCE(m.0));
-        let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), module, 0) {
-            Ok(h) => h,
-            Err(_) => {
-                let _ = tx.send(false);
-                return;
-            }
+        let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), module, 0) else {
+            let _ = tx.send(false);
+            return;
         };
-        KEY_HOOK_THREAD.store(GetCurrentThreadId(), Ordering::Relaxed);
+        KEY_HOOK_STARTED.store(true, Ordering::Relaxed);
         let _ = tx.send(true);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
@@ -393,47 +538,202 @@ pub fn start_keyboard_capture(sink: KeySink) -> bool {
     rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or(false)
 }
 
+pub fn keyboard_hook_active() -> bool {
+    KEY_HOOK_STARTED.load(Ordering::Relaxed)
+}
+
+pub fn set_control_shortcut(sc: &crate::shortcuts::Shortcut) {
+    CONTROL_SC.store(u32::from(sc.scancode().unwrap_or(0)), Ordering::Relaxed);
+    CONTROL_MODS.store(sc.mods(), Ordering::Relaxed);
+}
+
+/// Raccourcis actifs quand le curseur est sur la fenêtre PiP.
+pub fn set_pip_shortcuts(list: Vec<(u16, u8, u8, bool)>) {
+    *PIP_SHORTCUTS.lock().unwrap() = list;
+}
+
+/// Fenêtre toujours au premier plan : ses raccourcis marchent dès que le curseur est dans
+/// son rectangle. Sinon, seulement si elle est la fenêtre active (pas cachée par une autre).
+pub fn set_pip_on_top(on_top: bool) {
+    PIP_ON_TOP.store(on_top, Ordering::Relaxed);
+}
+
+pub fn set_pip_fullscreen(fullscreen: bool) {
+    PIP_FULLSCREEN.store(fullscreen, Ordering::Relaxed);
+}
+
+pub fn take_pip_actions() -> Vec<u8> {
+    std::mem::take(&mut *PIP_ACTIONS.lock().unwrap())
+}
+
+/// Mode contrôle : tout le clavier part vers `sink` (sauf le raccourci de contrôle).
+pub fn start_keyboard_capture(sink: KeySink) -> bool {
+    *KEY_SINK.lock().unwrap() = Some(sink);
+    HOOK_SEEN.store(0, Ordering::Relaxed);
+    HOOK_INJECTED.store(0, Ordering::Relaxed);
+    keyboard_hook_active()
+}
+
 pub fn stop_keyboard_capture() {
     *KEY_SINK.lock().unwrap() = None;
-    let tid = KEY_HOOK_THREAD.swap(0, Ordering::Relaxed);
-    if tid != 0 {
-        unsafe {
-            let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+}
+
+/// Le curseur est sur la fenêtre PiP, visible et non recouverte.
+fn cursor_on_pip() -> bool {
+    unsafe {
+        let hwnd = HWND(PIP_HWND.load(Ordering::Relaxed) as *mut _);
+        if hwnd.0.is_null() || !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return false;
         }
+        if !PIP_ON_TOP.load(Ordering::Relaxed) && GetForegroundWindow() != hwnd {
+            return false;
+        }
+        let (mut p, mut r) = (POINT::default(), RECT::default());
+        GetCursorPos(&mut p).is_ok()
+            && GetWindowRect(hwnd, &mut r).is_ok()
+            && p.x >= r.left
+            && p.x < r.right
+            && p.y >= r.top
+            && p.y < r.bottom
+    }
+}
+
+/// État des modificateurs suivi par le hook lui-même : quand le hook avale Ctrl/Alt/Maj
+/// (mode contrôle), Windows ne met pas à jour `GetAsyncKeyState`.
+static MODS_DOWN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// La touche du raccourci a été avalée : l'application au premier plan ne voit qu'un
+/// appui sur Alt, et son relâchement activerait sa barre de menu. Une touche neutre
+/// (0xE8, non attribuée) l'en empêche, comme le fait AutoHotkey.
+fn mask_alt_release() {
+    for up in [false, true] {
+        let input = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0xE8),
+                    wScan: 0,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    }
+}
+
+fn real_modifiers() -> u8 {
+    let down = |vk: VIRTUAL_KEY| unsafe { GetAsyncKeyState(vk.0 as i32) as u16 & 0x8000 != 0 };
+    u8::from(down(VK_CONTROL)) | (u8::from(down(VK_MENU)) << 1) | (u8::from(down(VK_SHIFT)) << 2)
+}
+
+fn track_modifier(vk: u16, down: bool) {
+    let bit = if [VK_CONTROL, VK_LCONTROL, VK_RCONTROL].iter().any(|m| m.0 == vk) {
+        1
+    } else if [VK_MENU, VK_LMENU, VK_RMENU].iter().any(|m| m.0 == vk) {
+        2
+    } else if [VK_SHIFT, VK_LSHIFT, VK_RSHIFT].iter().any(|m| m.0 == vk) {
+        4
+    } else {
+        return;
+    };
+    if down {
+        MODS_DOWN.fetch_or(bit, Ordering::Relaxed);
+    } else {
+        MODS_DOWN.fetch_and(!bit, Ordering::Relaxed);
     }
 }
 
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
-        if code >= 0 {
-            let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        if code < 0 {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        let k = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let down = !k.flags.contains(LLKHF_UP);
+        let mut sc = (k.scanCode & 0xFF) as u16;
+        if k.flags.contains(LLKHF_EXTENDED) {
+            sc |= 0xE000;
+        }
+        let vk = k.vkCode as u16;
+        let is_modifier = [VK_CONTROL, VK_LCONTROL, VK_RCONTROL, VK_MENU, VK_LMENU, VK_RMENU, VK_SHIFT, VK_LSHIFT, VK_RSHIFT]
+            .iter()
+            .any(|m| m.0 == vk);
+        let repeat = {
+            let mut keys = KEYS_DOWN.lock().unwrap();
+            let was_down = keys.contains(&sc);
+            if down && !was_down {
+                keys.push(sc);
+            } else if !down {
+                keys.retain(|&x| x != sc);
+            }
+            down && was_down
+        };
+        // Alt maintenu se répète (~30 fois/s) tant qu'il est la dernière touche enfoncée ;
+        // chaque répétition fermerait le menu d'Alt + clic droit. Le vrai relâchement
+        // d'Alt passe, lui, et ferme le menu comme voulu.
+        if repeat && [VK_MENU, VK_LMENU, VK_RMENU].iter().any(|m| m.0 == vk) && MENU_OPEN.load(Ordering::Relaxed) {
+            return LRESULT(1);
+        }
+        // Relâchement d'une touche interceptée à l'appui : intercepté aussi.
+        if !down {
+            let mut swallowed = KEYS_SWALLOWED.lock().unwrap();
+            if let Some(i) = swallowed.iter().position(|&x| x == sc) {
+                swallowed.remove(i);
+                return LRESULT(1);
+            }
+        }
+        let swallow_press = |sc: u16| {
+            KEYS_SWALLOWED.lock().unwrap().push(sc);
+            LRESULT(1)
+        };
+        track_modifier(vk, down);
+        let mods = MODS_DOWN.load(Ordering::Relaxed);
+
+        // 1. Raccourci de contrôle, partout.
+        if down && !is_modifier && u32::from(sc) == CONTROL_SC.load(Ordering::Relaxed) && mods == CONTROL_MODS.load(Ordering::Relaxed)
+        {
+            if !repeat {
+                HOTKEY_PRESSED.store(true, Ordering::Relaxed);
+            }
+            return swallow_press(sc);
+        }
+
+        // 2. Mode contrôle : tout part vers l'autre PC.
+        if let Some(sink) = KEY_SINK.lock().unwrap().as_ref() {
             HOOK_SEEN.fetch_add(1, Ordering::Relaxed);
-            // Les claviers « gaming » (logiciels de macros, etc.) réinjectent souvent les
-            // frappes : elles sont marquées simulées mais viennent bien de l'utilisateur.
+            // Les claviers « gaming » réinjectent souvent les frappes : elles sont marquées
+            // simulées mais viennent bien de l'utilisateur.
             if k.flags.contains(LLKHF_INJECTED) {
                 HOOK_INJECTED.fetch_add(1, Ordering::Relaxed);
             }
-            {
-                let down = !k.flags.contains(LLKHF_UP);
-                let vk = k.vkCode as u16;
-                if vk == VK_LCONTROL.0 || vk == VK_RCONTROL.0 || vk == VK_CONTROL.0 {
-                    CTRL_DOWN.store(down, Ordering::Relaxed);
+            sink(sc, down);
+            return LRESULT(1);
+        }
+
+        // 3. Alt maintenu + curseur sur la fenêtre PiP : ses raccourcis (Alt+A, Alt+1…).
+        // Sans Alt, aucune touche n'est captée. Hors mode contrôle, l'état réel des
+        // modificateurs (Windows) est fiable : le hook n'en avale aucun.
+        // Menu ouvert : les touches servent au menu.
+        if down && !is_modifier && !MENU_OPEN.load(Ordering::Relaxed) {
+            let real = real_modifiers();
+            MODS_DOWN.store(real, Ordering::Relaxed);
+            if real & 2 != 0 && cursor_on_pip() {
+                let extra = real & !2;
+                let hit = PIP_SHORTCUTS.lock().unwrap().iter().find(|(s, m, _, _)| *s == sc && *m == extra).copied();
+                if let Some((_, _, action, repeats)) = hit {
+                    if !repeat || repeats {
+                        PIP_ACTIONS.lock().unwrap().push(action);
+                    }
+                    mask_alt_release();
+                    return swallow_press(sc);
                 }
-                if vk == VK_LMENU.0 || vk == VK_RMENU.0 || vk == VK_MENU.0 {
-                    ALT_DOWN.store(down, Ordering::Relaxed);
-                }
-                if down && vk == u16::from(b'K') && CTRL_DOWN.load(Ordering::Relaxed) && ALT_DOWN.load(Ordering::Relaxed) {
-                    HOTKEY_PRESSED.store(true, Ordering::Relaxed);
-                    return LRESULT(1);
-                }
-                let mut sc = (k.scanCode & 0xFF) as u16;
-                if k.flags.contains(LLKHF_EXTENDED) {
-                    sc |= 0xE000;
-                }
-                if let Some(sink) = KEY_SINK.lock().unwrap().as_ref() {
-                    sink(sc, down);
-                    return LRESULT(1);
-                }
+            }
+            // Échap quitte le plein écran (sans Alt : on regarde la fenêtre PiP).
+            if sc == 0x01 && real == 0 && PIP_FULLSCREEN.load(Ordering::Relaxed) && cursor_on_pip() {
+                PIP_ACTIONS.lock().unwrap().push(ACTION_EXIT_FULLSCREEN);
+                return swallow_press(sc);
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
@@ -480,6 +780,7 @@ mod tests {
     fn keyboard_hook_receives_keys() {
         let got = Arc::new(AtomicU32::new(0));
         let g = got.clone();
+        assert!(start_keyboard_hook(Hwnd(HWND(std::ptr::null_mut()))));
         assert!(start_keyboard_capture(Box::new(move |_, _| {
             g.fetch_add(1, Ordering::Relaxed);
         })));

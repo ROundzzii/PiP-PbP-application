@@ -13,7 +13,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
+use winit::keyboard::{ModifiersState, PhysicalKey};
 use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{CursorGrabMode, CursorIcon, CustomCursor, Fullscreen, ResizeDirection, Window, WindowId, WindowLevel};
 
@@ -24,7 +24,12 @@ use crate::protocol::{
     REQ_AUTH, REQ_KEYFRAME,
 };
 use crate::render::{BORDER_WIDTH, Frame, Renderer};
-use crate::win::{self, Hwnd};
+use crate::shortcuts::{Action, Shortcut, Shortcuts};
+use crate::win::{self, Hwnd, MenuItem};
+
+/// Valeurs proposées dans le menu du clic droit.
+const HOVER_PRESETS: [u32; 6] = [10, 20, 30, 50, 75, 100];
+const OPACITY_PRESETS: [u32; 5] = [25, 50, 75, 90, 100];
 
 /// Fréquence de vérification de la position de la souris (survol).
 const HOVER_POLL: Duration = Duration::from_millis(15);
@@ -160,7 +165,7 @@ fn receive(
                     l.authed = ok;
                 }
                 if ok {
-                    eprintln!("Contrôle à distance : prêt — Ctrl+Alt+K pour prendre / rendre la main");
+                    eprintln!("Contrôle à distance : prêt — raccourci de contrôle (Ctrl+Alt+K par défaut) ou clic droit pour prendre la main");
                 } else {
                     eprintln!("Contrôle à distance : code refusé par la source");
                 }
@@ -262,11 +267,13 @@ struct App {
     debug_border: bool,
     /// Compteurs du mode contrôle (diagnostic) : mouvements, clics, touches envoyés.
     sent: (u32, u32, Arc<std::sync::atomic::AtomicU32>),
+    shortcuts: Shortcuts,
 }
 
 impl App {
     fn new(cfg: ViewConfig, slot: Slot, link: SharedLink) -> Self {
         Self {
+            shortcuts: Shortcuts::from_config(&cfg.shortcuts),
             cfg,
             slot,
             link,
@@ -381,66 +388,159 @@ impl App {
         if let Some(window) = &self.window {
             let fs = window.fullscreen().is_some();
             window.set_fullscreen((!fs).then_some(Fullscreen::Borderless(None)));
+            win::set_pip_fullscreen(!fs);
         }
         self.apply_opacity();
     }
 
-    fn on_key(&mut self, event_loop: &ActiveEventLoop, key: &Key) {
+    fn exit_fullscreen(&self) {
+        if let Some(w) = &self.window {
+            w.set_fullscreen(None);
+        }
+        win::set_pip_fullscreen(false);
+        self.apply_opacity();
+    }
+
+    /// Petite notification en haut de la fenêtre PiP.
+    fn notify(&self, text: &str) {
+        if let Some(h) = self.hwnd {
+            h.notify(text);
+        }
+    }
+
+    /// Exécute une action (raccourci clavier ou menu du clic droit).
+    fn perform(&mut self, event_loop: &ActiveEventLoop, action: Action) {
+        eprintln!("Action : {}", action.label());
         let step = 0.05;
-        match key {
-            Key::Named(NamedKey::F11) => self.toggle_fullscreen(),
-            Key::Named(NamedKey::Escape) => {
+        match action {
+            Action::ToggleControl => self.toggle_control(),
+            Action::Fullscreen => self.toggle_fullscreen(),
+            Action::LayoutPip => self.apply_layout("pip"),
+            Action::LayoutPbpLeft => self.apply_layout("pbp-left"),
+            Action::LayoutPbpRight => self.apply_layout("pbp-right"),
+            Action::ToggleAspect => {
+                self.cfg.keep_aspect = !self.cfg.keep_aspect;
+                self.request_redraw();
+                self.notify(if self.cfg.keep_aspect {
+                    "Étirement libre : désactivé — format de l'image conservé"
+                } else {
+                    "Étirement libre : activé — l'image remplit la fenêtre"
+                });
+            }
+            Action::ToggleClickThrough => {
+                self.cfg.click_through_on_hover = !self.cfg.click_through_on_hover;
+                if let Some(w) = &self.window
+                    && !self.control
+                {
+                    let _ = w.set_cursor_hittest(!(self.hovered && self.cfg.click_through_on_hover));
+                }
+                self.apply_opacity();
+                self.notify(if self.cfg.click_through_on_hover {
+                    "Clic à travers : activé — au survol, les clics vont à la fenêtre derrière"
+                } else {
+                    "Clic à travers : désactivé — la fenêtre PiP reçoit les clics"
+                });
+            }
+            Action::ToggleOnTop => {
+                self.cfg.always_on_top = !self.cfg.always_on_top;
                 if let Some(w) = &self.window {
-                    w.set_fullscreen(None);
+                    w.set_window_level(level(self.cfg.always_on_top));
                 }
+                win::set_pip_on_top(self.cfg.always_on_top);
                 self.apply_opacity();
+                self.notify(if self.cfg.always_on_top {
+                    "Toujours au premier plan : activé"
+                } else {
+                    "Toujours au premier plan : désactivé"
+                });
             }
-            Key::Named(NamedKey::ArrowUp) => {
-                self.cfg.hover_opacity = (self.cfg.hover_opacity + step).min(1.0);
-                eprintln!("Opacité au survol : {:.0} %", self.cfg.hover_opacity * 100.0);
+            Action::HoverOpacityUp | Action::HoverOpacityDown => {
+                let delta = if action == Action::HoverOpacityUp { step } else { -step };
+                self.set_hover_opacity(self.cfg.hover_opacity + delta);
             }
-            Key::Named(NamedKey::ArrowDown) => {
-                self.cfg.hover_opacity = (self.cfg.hover_opacity - step).max(0.0);
-                eprintln!("Opacité au survol : {:.0} %", self.cfg.hover_opacity * 100.0);
+            Action::OpacityUp | Action::OpacityDown => {
+                let delta = if action == Action::OpacityUp { step } else { -step };
+                self.set_opacity(self.cfg.opacity + delta);
             }
-            Key::Named(NamedKey::PageUp) => {
-                self.cfg.opacity = (self.cfg.opacity + step).min(1.0);
-                self.apply_opacity();
-            }
-            Key::Named(NamedKey::PageDown) => {
-                self.cfg.opacity = (self.cfg.opacity - step).max(0.1);
-                self.apply_opacity();
-            }
-            Key::Character(c) => match c.to_lowercase().as_str() {
-                "q" if self.modifiers.control_key() => event_loop.exit(),
-                "f" => self.toggle_fullscreen(),
-                "1" => self.apply_layout("pip"),
-                "2" => self.apply_layout("pbp-left"),
-                "3" => self.apply_layout("pbp-right"),
-                "a" => {
-                    self.cfg.keep_aspect = !self.cfg.keep_aspect;
-                    self.request_redraw();
-                    if let Some(h) = self.hwnd {
-                        h.notify(if self.cfg.keep_aspect {
-                            "Étirement libre : désactivé — format de l'image conservé"
-                        } else {
-                            "Étirement libre : activé — l'image remplit la fenêtre"
-                        });
-                    }
-                }
-                "c" => {
-                    self.cfg.click_through_on_hover = !self.cfg.click_through_on_hover;
-                    eprintln!("Clic à travers au survol : {}", self.cfg.click_through_on_hover);
-                }
-                "t" => {
-                    self.cfg.always_on_top = !self.cfg.always_on_top;
-                    if let Some(w) = &self.window {
-                        w.set_window_level(level(self.cfg.always_on_top));
-                    }
-                    self.apply_opacity();
-                }
-                _ => {}
+            Action::Close => event_loop.exit(),
+        }
+    }
+
+    fn set_hover_opacity(&mut self, value: f32) {
+        self.cfg.hover_opacity = (value * 20.0).round().clamp(0.0, 20.0) / 20.0;
+        self.apply_opacity();
+        self.notify(&format!("Opacité au survol : {:.0} %", self.cfg.hover_opacity * 100.0));
+    }
+
+    fn set_opacity(&mut self, value: f32) {
+        self.cfg.opacity = (value * 20.0).round().clamp(2.0, 20.0) / 20.0;
+        self.apply_opacity();
+        self.notify(&format!("Opacité normale : {:.0} %", self.cfg.opacity * 100.0));
+    }
+
+    /// Menu d'Alt + clic droit sur la fenêtre PiP (ouvert sur son propre thread, le choix
+    /// arrive dans `about_to_wait`).
+    fn show_menu(&mut self) {
+        let Some(window) = self.window.clone() else { return };
+        let sc = |a: Action| self.shortcuts.get(a).display_for(a);
+        let item = |id: u32, label: &str, shortcut: Option<String>, checked: bool| MenuItem::Item {
+            id,
+            label: match shortcut {
+                Some(s) => format!("{label}\t{s}"),
+                None => label.to_string(),
             },
+            checked,
+        };
+        let percent_items = |base: u32, values: &[u32], current: f32| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| item(base + i as u32, &format!("{v} %"), None, (current * 100.0).round() as u32 == *v))
+                .collect::<Vec<_>>()
+        };
+        let fullscreen = window.fullscreen().is_some();
+        let items = vec![
+            item(
+                1,
+                if self.control { "Rendre la main" } else { "Prendre le contrôle de l'autre PC" },
+                Some(sc(Action::ToggleControl)),
+                false,
+            ),
+            MenuItem::Separator,
+            item(2, if fullscreen { "Quitter le plein écran" } else { "Plein écran" }, Some(sc(Action::Fullscreen)), false),
+            MenuItem::Submenu {
+                label: "Disposition".into(),
+                items: vec![
+                    item(3, "PiP — coin bas-droit", Some(sc(Action::LayoutPip)), self.cfg.layout == "pip"),
+                    item(4, "PbP — moitié gauche", Some(sc(Action::LayoutPbpLeft)), self.cfg.layout == "pbp-left"),
+                    item(5, "PbP — moitié droite", Some(sc(Action::LayoutPbpRight)), self.cfg.layout == "pbp-right"),
+                ],
+            },
+            MenuItem::Separator,
+            item(6, "Étirement libre", Some(sc(Action::ToggleAspect)), !self.cfg.keep_aspect),
+            item(7, "Clic à travers au survol", Some(sc(Action::ToggleClickThrough)), self.cfg.click_through_on_hover),
+            item(8, "Toujours au premier plan", Some(sc(Action::ToggleOnTop)), self.cfg.always_on_top),
+            MenuItem::Submenu { label: "Opacité au survol".into(), items: percent_items(20, &HOVER_PRESETS, self.cfg.hover_opacity) },
+            MenuItem::Submenu { label: "Opacité normale".into(), items: percent_items(40, &OPACITY_PRESETS, self.cfg.opacity) },
+            MenuItem::Separator,
+            item(99, "Fermer la fenêtre PiP", Some(sc(Action::Close)), false),
+        ];
+        win::open_menu(items);
+    }
+
+    fn on_menu_choice(&mut self, event_loop: &ActiveEventLoop, id: u32) {
+        match id {
+            1 => self.perform(event_loop, Action::ToggleControl),
+            2 => self.perform(event_loop, Action::Fullscreen),
+            3 => self.perform(event_loop, Action::LayoutPip),
+            4 => self.perform(event_loop, Action::LayoutPbpLeft),
+            5 => self.perform(event_loop, Action::LayoutPbpRight),
+            6 => self.perform(event_loop, Action::ToggleAspect),
+            7 => self.perform(event_loop, Action::ToggleClickThrough),
+            8 => self.perform(event_loop, Action::ToggleOnTop),
+            20..40 => self.set_hover_opacity(HOVER_PRESETS[(id - 20) as usize] as f32 / 100.0),
+            40..60 => self.set_opacity(OPACITY_PRESETS[(id - 40) as usize] as f32 / 100.0),
+            99 => self.perform(event_loop, Action::Close),
             _ => {}
         }
     }
@@ -463,6 +563,7 @@ impl App {
         };
         if let Some(reason) = refusal {
             eprintln!("Contrôle à distance impossible : {reason}");
+            self.notify(&format!("Contrôle impossible : {reason}"));
             return;
         }
         let Some(window) = self.window.clone() else { return };
@@ -498,7 +599,9 @@ impl App {
         self.sent.0 = 0;
         self.sent.1 = 0;
         self.sent.2.store(0, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("Contrôle à distance : ACTIF (Ctrl+Alt+K pour rendre la main)");
+        let key = self.shortcuts.get(Action::ToggleControl).display();
+        eprintln!("Contrôle à distance : ACTIF ({key} pour rendre la main)");
+        self.notify(&format!("Contrôle de l'autre PC : actif — {key} pour rendre la main"));
         self.request_redraw();
     }
 
@@ -534,6 +637,7 @@ impl App {
             seen,
             injected
         );
+        self.notify("Contrôle rendu — la souris et le clavier reviennent sur ce PC");
         self.request_redraw();
     }
 
@@ -638,8 +742,25 @@ impl ApplicationHandler<UserEvent> for App {
         ));
         if let Some(h) = self.hwnd {
             h.follow_suggested_dpi_rect();
-            if !h.register_control_hotkey() {
-                eprintln!("Raccourci Ctrl+Alt+K indisponible (déjà utilisé par une autre application)");
+            let control = self.shortcuts.get(Action::ToggleControl).clone();
+            win::set_control_shortcut(&control);
+            win::set_pip_shortcuts(
+                Action::ALL
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| !a.is_global())
+                    .filter_map(|(i, &a)| {
+                        let sc = self.shortcuts.get(a);
+                        Some((sc.scancode()?, sc.without_alt().mods(), i as u8, a.repeats()))
+                    })
+                    .collect(),
+            );
+            win::set_pip_on_top(self.cfg.always_on_top);
+            if !win::start_keyboard_hook(h) {
+                eprintln!("Raccourcis au survol indisponibles (hook clavier refusé par Windows)");
+                if !h.register_control_hotkey(&control) {
+                    eprintln!("Raccourci {} indisponible (déjà utilisé par une autre application)", control.display());
+                }
             }
         }
         match Renderer::new(window.clone()) {
@@ -686,6 +807,22 @@ impl ApplicationHandler<UserEvent> for App {
         if win::take_control_hotkey() {
             self.toggle_control();
         }
+        for a in win::take_pip_actions() {
+            match a {
+                win::ACTION_EXIT_FULLSCREEN => self.exit_fullscreen(),
+                i => {
+                    if let Some(&action) = Action::ALL.get(i as usize) {
+                        self.perform(event_loop, action);
+                    }
+                }
+            }
+        }
+        if win::menu_open() && !win::alt_down() {
+            win::close_menu();
+        }
+        if let Some(id) = win::take_menu_choice() {
+            self.on_menu_choice(event_loop, id);
+        }
         self.update_hover();
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + HOVER_POLL));
     }
@@ -721,6 +858,10 @@ impl ApplicationHandler<UserEvent> for App {
                     self.layout_applied = true;
                     let layout = self.cfg.layout.clone();
                     self.apply_layout(&layout);
+                    // Vérification visuelle du menu du clic droit (variable PIP_MENU_TEST).
+                    if std::env::var("PIP_MENU_TEST").is_ok() {
+                        self.show_menu();
+                    }
                     // Vérification visuelle de la notification (variable PIP_OSD_TEST).
                     if std::env::var("PIP_OSD_TEST").is_ok()
                         && let Some(h) = self.hwnd
@@ -741,6 +882,13 @@ impl ApplicationHandler<UserEvent> for App {
                         None => CursorIcon::Move,
                     };
                     w.set_cursor(icon);
+                }
+            }
+            // Alt + clic droit : menu (sans Alt, le clic droit traverse la fenêtre).
+            // Alt + clic droit : menu, tant qu'Alt reste enfoncé (fermé au relâchement).
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Right, .. } => {
+                if win::alt_down() {
+                    self.show_menu();
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
@@ -764,8 +912,25 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 self.zoom(steps);
             }
-            WindowEvent::KeyboardInput { event: KeyEvent { logical_key, state: ElementState::Pressed, .. }, .. } => {
-                self.on_key(event_loop, &logical_key);
+            WindowEvent::KeyboardInput {
+                event: KeyEvent { physical_key: PhysicalKey::Code(code), state: ElementState::Pressed, repeat, .. },
+                ..
+            } => {
+                // Normalement le hook clavier gère les raccourcis (curseur sur la fenêtre).
+                if win::keyboard_hook_active() {
+                    return;
+                }
+                let pressed = Shortcut::from_winit(code, self.modifiers).filter(|p| p.alt).map(|p| p.without_alt());
+                let lookup = |p: &Shortcut| Action::ALL.into_iter().find(|&a| self.shortcuts.get(a).without_alt() == *p);
+                match pressed.as_ref().and_then(lookup) {
+                    // Le raccourci de contrôle est géré globalement (RegisterHotKey).
+                    Some(Action::ToggleControl) => {}
+                    Some(action) if !repeat || action.repeats() => self.perform(event_loop, action),
+                    Some(_) => {}
+                    // Échap quitte toujours le plein écran.
+                    None if code == winit::keyboard::KeyCode::Escape => self.exit_fullscreen(),
+                    None => {}
+                }
             }
             _ => {}
         }

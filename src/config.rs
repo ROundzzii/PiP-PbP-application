@@ -92,6 +92,8 @@ pub struct ViewConfig {
     /// Code de contrôle de la source (variable d'environnement PIP_CODE, jamais enregistré ici).
     #[serde(skip)]
     pub control_code: String,
+    /// Raccourcis clavier personnalisés (action -> « Ctrl+Alt+K »), sinon ceux par défaut.
+    pub shortcuts: std::collections::BTreeMap<String, String>,
     /// Fraction de la largeur de l'écran utilisée en mode PiP.
     pub pip_scale: f32,
 }
@@ -111,6 +113,7 @@ impl Default for ViewConfig {
             height: 540,
             layout: "pip".into(),
             control_code: String::new(),
+            shortcuts: Default::default(),
             pip_scale: 0.3,
         }
     }
@@ -227,4 +230,21 @@ fn default_locations() -> Vec<PathBuf> {
         v.push(PathBuf::from(appdata).join("pip-pbp").join(CONFIG_FILE_NAME));
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shortcuts_survive_save_and_load() {
+        let mut cfg = FileConfig::default();
+        cfg.view.shortcuts.insert("toggle_control".into(), "Ctrl+Shift+F12".into());
+        cfg.connections.push(Connection { name: "PC".into(), host: "192.168.1.15".into(), ..Default::default() });
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: FileConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
+        let s = crate::shortcuts::Shortcuts::from_config(&back.view.shortcuts);
+        assert_eq!(s.get(crate::shortcuts::Action::ToggleControl).to_string(), "Ctrl+Shift+F12");
+    }
 }

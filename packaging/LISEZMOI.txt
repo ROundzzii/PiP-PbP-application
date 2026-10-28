@@ -16,18 +16,21 @@ Pas de compte, pas de code à partager comme AnyDesk : les PC se trouvent tout s
    Si la recherche ne trouve rien, saisissez l'IP affichée sur la source
    (onglet « Partager cet écran », rubrique « Adresses de ce PC »).
 
+Raccourcis : modifiables dans l'onglet « Raccourcis » de l'interface.
+
 Réglages (opacité au survol, disposition PiP/PbP, fps, débit, écran capturé…) :
 onglet « Réglages d'affichage » et « Partager cet écran ». Ils sont enregistrés
 automatiquement dans %APPDATA%\pip-pbp\pip-pbp.toml.
 
-Dans la fenêtre PiP :
-  - souris dessus         -> transparente, les clics passent à travers
-  - Alt maintenu          -> redevient normale (pour la déplacer / redimensionner)
-  - molette               -> agrandir / réduire
-  - double-clic ou F      -> plein écran
-  - 1 / 2 / 3             -> coin (PiP) / moitié gauche / moitié droite (PbP)
-  - flèches haut / bas    -> opacité au survol
-  - Ctrl+Q                -> fermer la fenêtre
+Dans la fenêtre PiP (Alt = touche d'interaction, curseur sur la fenêtre) :
+  - souris dessus         -> transparente, clics et touches passent derrière
+  - Alt maintenu          -> fenêtre normale : la déplacer, la redimensionner
+  - Alt + clic droit      -> menu de toutes les options (se ferme en lâchant Alt)
+  - Alt+1 / Alt+2 / Alt+3 -> coin (PiP) / moitié gauche / moitié droite (PbP)
+  - Alt+A                 -> étirement libre
+  - Alt+haut / Alt+bas    -> opacité au survol
+  - Alt+Q                 -> fermer la fenêtre
+  - Ctrl+Alt+K            -> prendre / rendre la main sur l'autre PC (partout)
 
 Contrôle à distance (souris et clavier de l'autre PC) :
   - sur la source : cocher « Autoriser l'autre PC à piloter… » et noter le code
