@@ -9,6 +9,7 @@ mod capture;
 mod config;
 mod discovery;
 mod gui;
+mod osd;
 mod protocol;
 mod render;
 mod sender;

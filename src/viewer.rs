@@ -420,6 +420,13 @@ impl App {
                 "a" => {
                     self.cfg.keep_aspect = !self.cfg.keep_aspect;
                     self.request_redraw();
+                    if let Some(h) = self.hwnd {
+                        h.notify(if self.cfg.keep_aspect {
+                            "Étirement libre : désactivé — format de l'image conservé"
+                        } else {
+                            "Étirement libre : activé — l'image remplit la fenêtre"
+                        });
+                    }
                 }
                 "c" => {
                     self.cfg.click_through_on_hover = !self.cfg.click_through_on_hover;
@@ -714,6 +721,12 @@ impl ApplicationHandler<UserEvent> for App {
                     self.layout_applied = true;
                     let layout = self.cfg.layout.clone();
                     self.apply_layout(&layout);
+                    // Vérification visuelle de la notification (variable PIP_OSD_TEST).
+                    if std::env::var("PIP_OSD_TEST").is_ok()
+                        && let Some(h) = self.hwnd
+                    {
+                        h.notify("Étirement libre : activé — l'image remplit la fenêtre");
+                    }
                 }
             }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),

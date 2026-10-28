@@ -61,6 +61,18 @@ impl Hwnd {
         }
     }
 
+    /// Petite notification en haut au centre de la fenêtre, qui disparaît seule.
+    pub fn notify(self, text: &str) {
+        let mut r = RECT::default();
+        unsafe {
+            if GetWindowRect(self.0, &mut r).is_err() {
+                return;
+            }
+        }
+        let scale = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(self.0) } as f32 / 96.0;
+        crate::osd::show(r, scale.max(1.0), text);
+    }
+
     /// Raccourci global Ctrl+Alt+K (mode contrôle), reçu même quand la fenêtre n'a pas
     /// le focus. Nécessite `follow_suggested_dpi_rect` (même sous-classement de fenêtre).
     pub fn register_control_hotkey(self) -> bool {
