@@ -269,7 +269,8 @@ fn send_mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> bool {
 type KeySink = Box<dyn Fn(u16, bool) + Send>;
 
 static KEY_SINK: std::sync::Mutex<Option<KeySink>> = std::sync::Mutex::new(None);
-static KEY_HOOK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Identifiant du thread qui porte le hook clavier (0 = pas de hook).
+static KEY_HOOK_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 static HOOK_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static HOOK_INJECTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -283,37 +284,48 @@ static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 /// Mode contrôle : intercepte TOUT le clavier avant Windows (touche Windows, Alt+Tab,
 /// Ctrl+Échap…), l'envoie à `sink` et l'empêche d'agir sur ce PC. Ctrl+Alt+K reste
 /// géré localement (rendre la main). Ctrl+Alt+Suppr ne peut pas être intercepté.
-/// À appeler depuis le thread de la boucle d'évènements (le hook en dépend).
+///
+/// Le hook tourne sur son propre thread avec sa propre boucle de messages : Windows
+/// n'appelle un hook bas niveau que pendant que son thread attend des messages, et le
+/// supprime en silence s'il répond trop lentement (la boucle de la fenêtre ne suffit pas).
 pub fn start_keyboard_capture(sink: KeySink) -> bool {
-    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     *KEY_SINK.lock().unwrap() = Some(sink);
     CTRL_DOWN.store(false, Ordering::Relaxed);
     ALT_DOWN.store(false, Ordering::Relaxed);
     HOOK_SEEN.store(0, Ordering::Relaxed);
     HOOK_INJECTED.store(0, Ordering::Relaxed);
-    if KEY_HOOK.load(Ordering::Relaxed) != 0 {
+    if KEY_HOOK_THREAD.load(Ordering::Relaxed) != 0 {
         return true;
     }
-    unsafe {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::System::Threading::GetCurrentThreadId;
         let module = GetModuleHandleW(None).ok().map(|m| windows::Win32::Foundation::HINSTANCE(m.0));
-        match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), module, 0) {
-            Ok(h) => {
-                KEY_HOOK.store(h.0 as isize, Ordering::Relaxed);
-                true
+        let hook = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), module, 0) {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = tx.send(false);
+                return;
             }
-            Err(_) => false,
-        }
-    }
+        };
+        KEY_HOOK_THREAD.store(GetCurrentThreadId(), Ordering::Relaxed);
+        let _ = tx.send(true);
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+        let _ = UnhookWindowsHookEx(hook);
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap_or(false)
 }
 
 pub fn stop_keyboard_capture() {
-    let h = KEY_HOOK.swap(0, Ordering::Relaxed);
-    if h != 0 {
+    *KEY_SINK.lock().unwrap() = None;
+    let tid = KEY_HOOK_THREAD.swap(0, Ordering::Relaxed);
+    if tid != 0 {
         unsafe {
-            let _ = UnhookWindowsHookEx(HHOOK(h as *mut _));
+            let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
         }
     }
-    *KEY_SINK.lock().unwrap() = None;
 }
 
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -350,5 +362,41 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
             }
         }
         CallNextHookEx(None, code, wparam, lparam)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    /// Vérifie que le hook clavier reçoit bien les touches. Simule F24 (touche absente
+    /// des claviers, interceptée et bloquée par le hook). Lancer avec `--ignored`.
+    #[test]
+    #[ignore]
+    fn keyboard_hook_receives_keys() {
+        let got = Arc::new(AtomicU32::new(0));
+        let g = got.clone();
+        assert!(start_keyboard_capture(Box::new(move |_, _| {
+            g.fetch_add(1, Ordering::Relaxed);
+        })));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        for up in [false, true] {
+            let mut flags = KEYBD_EVENT_FLAGS(0);
+            if up {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            let input = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VK_F24, wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+            };
+            unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        stop_keyboard_capture();
+        let (seen, injected) = keyboard_hook_stats();
+        println!("touches transmises : {}, vues par le hook : {seen} (simulées : {injected})", got.load(Ordering::Relaxed));
+        assert_eq!(got.load(Ordering::Relaxed), 2);
     }
 }
