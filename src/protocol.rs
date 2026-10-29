@@ -8,9 +8,10 @@ use std::io::{self, Read, Write};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
-pub const MAGIC: &[u8; 8] = b"PIPPBP02";
+pub const MAGIC: &[u8; 8] = b"PIPPBP03";
 
-/// Paquet vidéo : un frame H.264 (Annex B) complet.
+/// Paquet vidéo : `[u64 instant de capture][u64 instant d'envoi]` (µs, horloge de la
+/// source, voir `latency`) puis un frame H.264 (Annex B) complet.
 pub const MSG_VIDEO: u8 = 1;
 /// Un autre viewer a pris la place de celui-ci : il doit se fermer sans se reconnecter.
 pub const MSG_REPLACED: u8 = 2;
@@ -18,11 +19,15 @@ pub const MSG_REPLACED: u8 = 2;
 pub const MSG_HELLO: u8 = 3;
 /// Résultat de l'authentification : `[u8 1 = accepté, 0 = refusé]`.
 pub const MSG_AUTH: u8 = 4;
+/// Réponse à un ping : `[u64 heure du viewer à l'envoi][u64 heure de la source]` (µs).
+pub const MSG_PONG: u8 = 5;
 
 /// Requête du viewer : envoyer une image clé (après une erreur de décodage).
 pub const REQ_KEYFRAME: u8 = 1;
 /// Preuve du code de contrôle : HMAC-SHA256(code, nombre aléatoire du HELLO), 32 octets.
 pub const REQ_AUTH: u8 = 2;
+/// Ping de synchronisation des horloges : `[u64 heure du viewer]` (µs).
+pub const REQ_PING: u8 = 3;
 /// Position absolue de la souris sur l'écran partagé : `[u16 x][u16 y]`, 0..=65535.
 pub const IN_MOUSE_MOVE: u8 = 10;
 /// Bouton souris : `[u8 bouton 0=gauche 1=droit 2=milieu 3=X1 4=X2][u8 1=enfoncé]`.

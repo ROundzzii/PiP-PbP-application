@@ -61,6 +61,10 @@ impl Hwnd {
         }
     }
 
+    pub fn raw(self) -> isize {
+        self.0.0 as isize
+    }
+
     /// Petite notification en haut au centre de la fenêtre, qui disparaît seule.
     pub fn notify(self, text: &str) {
         let mut r = RECT::default();

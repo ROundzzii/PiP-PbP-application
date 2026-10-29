@@ -141,6 +141,7 @@ l'effet ne se voit pas tout de suite affichent une petite notification.
 | **Alt+C** | Clic à travers on/off |
 | **Alt+T** | Toujours au premier plan on/off |
 | **Alt+A** | Étirement libre on/off |
+| **Alt+L** | Compteur de latence (capture → affichage) on/off |
 | **Alt + clic droit** | Menu des options |
 | **Échap** | Quitter le plein écran |
 | **Ctrl+Alt+K** | Contrôle de l'autre PC (KVM) : prendre / rendre la main |

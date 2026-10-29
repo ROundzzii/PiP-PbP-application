@@ -96,6 +96,8 @@ pub struct ViewConfig {
     pub shortcuts: std::collections::BTreeMap<String, String>,
     /// Fraction de la largeur de l'écran utilisée en mode PiP.
     pub pip_scale: f32,
+    /// Compteur de latence affiché sur la fenêtre PiP.
+    pub show_latency: bool,
 }
 
 impl Default for ViewConfig {
@@ -115,6 +117,7 @@ impl Default for ViewConfig {
             control_code: String::new(),
             shortcuts: Default::default(),
             pip_scale: 0.3,
+            show_latency: false,
         }
     }
 }

@@ -19,6 +19,7 @@ pub enum Action {
     ToggleAspect,
     ToggleClickThrough,
     ToggleOnTop,
+    ToggleLatency,
     HoverOpacityUp,
     HoverOpacityDown,
     OpacityUp,
@@ -27,7 +28,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 13] = [
+    pub const ALL: [Action; 14] = [
         Action::ToggleControl,
         Action::Fullscreen,
         Action::LayoutPip,
@@ -36,6 +37,7 @@ impl Action {
         Action::ToggleAspect,
         Action::ToggleClickThrough,
         Action::ToggleOnTop,
+        Action::ToggleLatency,
         Action::HoverOpacityUp,
         Action::HoverOpacityDown,
         Action::OpacityUp,
@@ -54,6 +56,7 @@ impl Action {
             Action::ToggleAspect => "toggle_free_stretch",
             Action::ToggleClickThrough => "toggle_click_through",
             Action::ToggleOnTop => "toggle_always_on_top",
+            Action::ToggleLatency => "toggle_latency",
             Action::HoverOpacityUp => "hover_opacity_up",
             Action::HoverOpacityDown => "hover_opacity_down",
             Action::OpacityUp => "opacity_up",
@@ -72,6 +75,7 @@ impl Action {
             Action::ToggleAspect => "Étirement libre activé / désactivé",
             Action::ToggleClickThrough => "Clic à travers au survol",
             Action::ToggleOnTop => "Toujours au premier plan",
+            Action::ToggleLatency => "Afficher la latence",
             Action::HoverOpacityUp => "Opacité au survol +5 %",
             Action::HoverOpacityDown => "Opacité au survol −5 %",
             Action::OpacityUp => "Opacité normale +5 %",
@@ -90,6 +94,7 @@ impl Action {
             Action::ToggleAspect => "A",
             Action::ToggleClickThrough => "C",
             Action::ToggleOnTop => "T",
+            Action::ToggleLatency => "L",
             Action::HoverOpacityUp => "ArrowUp",
             Action::HoverOpacityDown => "ArrowDown",
             Action::OpacityUp => "PageUp",

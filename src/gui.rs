@@ -551,6 +551,10 @@ impl Gui {
             ui.checkbox(&mut v.always_on_top, "Toujours au-dessus des autres fenêtres");
             ui.end_row();
 
+            ui.label("Latence");
+            ui.checkbox(&mut v.show_latency, "Afficher le compteur de latence sur la fenêtre PiP");
+            ui.end_row();
+
             ui.label("Proportions");
             ui.checkbox(&mut v.keep_aspect, "Garder le ratio de l'image (bandes noires)");
             ui.end_row();

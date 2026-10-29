@@ -21,8 +21,10 @@ use crate::config::ViewConfig;
 use crate::discovery;
 use crate::protocol::{
     self, IN_KEY, IN_MOUSE_BUTTON, IN_MOUSE_MOVE, IN_WHEEL, MAGIC, MSG_AUTH, MSG_HELLO, MSG_REPLACED, MSG_VIDEO,
-    REQ_AUTH, REQ_KEYFRAME,
+    REQ_AUTH, REQ_KEYFRAME, REQ_PING, MSG_PONG,
 };
+use crate::latency::{self, ClockSync, FrameTiming, LatencyStats};
+use crate::osd;
 use crate::render::{BORDER_WIDTH, Frame, Renderer};
 use crate::shortcuts::{Action, Shortcut, Shortcuts};
 use crate::win::{self, Hwnd, MenuItem};
@@ -66,6 +68,9 @@ fn send_request(link: &SharedLink, kind: u8, payload: &[u8]) {
 /// On n'affiche jamais une image en retard, on prend toujours la plus récente.
 type Slot = Arc<Mutex<Option<Frame>>>;
 
+/// Décalage entre l'horloge de la source et celle de ce PC (mesure de latence).
+type Clock = Arc<Mutex<ClockSync>>;
+
 pub fn run(cfg: ViewConfig) -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     // Pas d'abonnement « Raw Input » de winit (inutile ici) : il empêche le hook clavier
@@ -73,18 +78,27 @@ pub fn run(cfg: ViewConfig) -> anyhow::Result<()> {
     event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
     let slot: Slot = Arc::default();
     let link: SharedLink = Arc::default();
+    let clock: Clock = Arc::default();
     {
-        let (slot, link, proxy) = (slot.clone(), link.clone(), event_loop.create_proxy());
+        let (slot, link, clock, proxy) = (slot.clone(), link.clone(), clock.clone(), event_loop.create_proxy());
         let (host, port, code) = (cfg.host.clone(), cfg.port, cfg.control_code.clone());
-        std::thread::spawn(move || network_loop(&host, port, &code, &slot, &link, &proxy));
+        std::thread::spawn(move || network_loop(&host, port, &code, &slot, &link, &clock, &proxy));
     }
-    let mut app = App::new(cfg, slot, link);
+    let mut app = App::new(cfg, slot, link, clock);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
 /// `host` vide ou "auto" : la source est cherchée automatiquement sur le réseau local.
-fn network_loop(host: &str, port: u16, code: &str, slot: &Slot, link: &SharedLink, proxy: &EventLoopProxy<UserEvent>) {
+fn network_loop(
+    host: &str,
+    port: u16,
+    code: &str,
+    slot: &Slot,
+    link: &SharedLink,
+    clock: &Clock,
+    proxy: &EventLoopProxy<UserEvent>,
+) {
     let auto = host.is_empty() || host.eq_ignore_ascii_case("auto");
     loop {
         let host = if auto {
@@ -101,7 +115,8 @@ fn network_loop(host: &str, port: u16, code: &str, slot: &Slot, link: &SharedLin
             host.to_string()
         };
         let _ = proxy.send_event(UserEvent::Status(format!("Connexion à {host}:{port}…")));
-        let result = receive(&host, port, code, slot, link, proxy);
+        *clock.lock().unwrap() = ClockSync::default();
+        let result = receive(&host, port, code, slot, link, clock, proxy);
         *link.lock().unwrap() = None;
         let _ = proxy.send_event(UserEvent::Disconnected);
         match result {
@@ -124,6 +139,7 @@ fn receive(
     code: &str,
     slot: &Slot,
     link: &SharedLink,
+    clock: &Clock,
     proxy: &EventLoopProxy<UserEvent>,
 ) -> anyhow::Result<bool> {
     let stream = connect(host, port)?;
@@ -153,11 +169,36 @@ fn receive(
         send_request(link, REQ_AUTH, &protocol::auth_proof(code, &buf[1..]));
     }
 
+    // Synchronisation des horloges : un ping par seconde tant que la connexion vit.
+    let pinging = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let (pinging, link) = (pinging.clone(), link.clone());
+        std::thread::spawn(move || {
+            while pinging.load(std::sync::atomic::Ordering::Relaxed) {
+                send_request(&link, REQ_PING, &latency::now_us().to_le_bytes());
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+    struct StopPing(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for StopPing {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let _stop_ping = StopPing(pinging);
+
     let mut decoder = Decoder::new()?;
     let mut stats = (Instant::now(), 0u32, 0.0f64);
     loop {
         match protocol::read_packet(&mut reader, &mut buf)? {
-            MSG_VIDEO => {}
+            MSG_VIDEO if buf.len() > latency::VIDEO_HEADER => {}
+            MSG_PONG if buf.len() == 16 => {
+                let t0 = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                let ts = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+                clock.lock().unwrap().add(t0, ts, latency::now_us());
+                continue;
+            }
             MSG_REPLACED => return Ok(true),
             MSG_AUTH => {
                 let ok = buf.first() == Some(&1);
@@ -173,10 +214,14 @@ fn receive(
             }
             _ => continue,
         }
+        let received = latency::now_us();
+        let capture = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let sent = u64::from_le_bytes(buf[8..16].try_into().unwrap());
         let t0 = Instant::now();
-        match decoder.decode(&buf) {
+        match decoder.decode(&buf[latency::VIDEO_HEADER..]) {
             Ok(Some(yuv)) => {
-                let frame = copy_frame(&yuv);
+                let mut frame = copy_frame(&yuv);
+                frame.timing = Some(FrameTiming { capture, sent, received, decoded: latency::now_us() });
                 *slot.lock().unwrap() = Some(frame);
                 let _ = proxy.send_event(UserEvent::NewFrame);
             }
@@ -237,6 +282,7 @@ fn copy_frame(yuv: &impl YUVSource) -> Frame {
         y: plane(yuv.y(), sy, w, h),
         u: plane(yuv.u(), su, w / 2, h / 2),
         v: plane(yuv.v(), sv, w / 2, h / 2),
+        timing: None,
     }
 }
 
@@ -268,11 +314,19 @@ struct App {
     /// Compteurs du mode contrôle (diagnostic) : mouvements, clics, touches envoyés.
     sent: (u32, u32, Arc<std::sync::atomic::AtomicU32>),
     shortcuts: Shortcuts,
+    clock: Clock,
+    latency: LatencyStats,
+    last_latency_log: Instant,
+    last_overlay_update: Instant,
 }
 
 impl App {
-    fn new(cfg: ViewConfig, slot: Slot, link: SharedLink) -> Self {
+    fn new(cfg: ViewConfig, slot: Slot, link: SharedLink, clock: Clock) -> Self {
         Self {
+            clock,
+            latency: LatencyStats::default(),
+            last_latency_log: Instant::now(),
+            last_overlay_update: Instant::now(),
             shortcuts: Shortcuts::from_config(&cfg.shortcuts),
             cfg,
             slot,
@@ -462,7 +516,25 @@ impl App {
                 let delta = if action == Action::OpacityUp { step } else { -step };
                 self.set_opacity(self.cfg.opacity + delta);
             }
+            Action::ToggleLatency => {
+                self.cfg.show_latency = !self.cfg.show_latency;
+                self.update_latency_overlay();
+                self.notify(if self.cfg.show_latency { "Latence : affichée" } else { "Latence : masquée" });
+            }
             Action::Close => event_loop.exit(),
+        }
+    }
+
+    /// Compteur de latence en surimpression sur la fenêtre PiP.
+    fn update_latency_overlay(&self) {
+        let Some(h) = self.hwnd else { return };
+        if self.cfg.show_latency {
+            if !self.latency.has_data() {
+                osd::set_info_text("Latence : mesure en cours…");
+            }
+            osd::show_info(h.raw());
+        } else {
+            osd::hide_info();
         }
     }
 
@@ -520,6 +592,7 @@ impl App {
             item(6, "Étirement libre", Some(sc(Action::ToggleAspect)), !self.cfg.keep_aspect),
             item(7, "Clic à travers au survol", Some(sc(Action::ToggleClickThrough)), self.cfg.click_through_on_hover),
             item(8, "Toujours au premier plan", Some(sc(Action::ToggleOnTop)), self.cfg.always_on_top),
+            item(9, "Afficher la latence", Some(sc(Action::ToggleLatency)), self.cfg.show_latency),
             MenuItem::Submenu { label: "Opacité au survol".into(), items: percent_items(20, &HOVER_PRESETS, self.cfg.hover_opacity) },
             MenuItem::Submenu { label: "Opacité normale".into(), items: percent_items(40, &OPACITY_PRESETS, self.cfg.opacity) },
             MenuItem::Separator,
@@ -538,6 +611,7 @@ impl App {
             6 => self.perform(event_loop, Action::ToggleAspect),
             7 => self.perform(event_loop, Action::ToggleClickThrough),
             8 => self.perform(event_loop, Action::ToggleOnTop),
+            9 => self.perform(event_loop, Action::ToggleLatency),
             20..40 => self.set_hover_opacity(HOVER_PRESETS[(id - 20) as usize] as f32 / 100.0),
             40..60 => self.set_opacity(OPACITY_PRESETS[(id - 40) as usize] as f32 / 100.0),
             99 => self.perform(event_loop, Action::Close),
@@ -772,6 +846,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         self.window = Some(window);
+        self.update_latency_overlay();
         // Autotest du hook clavier dans les conditions réelles (variable PIP_HOOK_SELFTEST).
         if std::env::var("PIP_HOOK_SELFTEST").is_ok() {
             let started = win::start_keyboard_capture(Box::new(|_, _| {}));
@@ -804,6 +879,17 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.latency.has_data() {
+            if self.last_latency_log.elapsed() >= Duration::from_secs(5) {
+                self.last_latency_log = Instant::now();
+                let rtt = self.clock.lock().unwrap().rtt_us().map(|us| us as f64 / 1000.0).unwrap_or(0.0);
+                eprintln!("{} | aller-retour réseau {rtt:.1} ms", self.latency.summary());
+            }
+            if self.cfg.show_latency && self.last_overlay_update.elapsed() >= Duration::from_millis(500) {
+                self.last_overlay_update = Instant::now();
+                osd::set_info_text(&self.latency.overlay());
+            }
+        }
         if win::take_control_hotkey() {
             self.toggle_control();
         }
@@ -846,13 +932,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 let Some(r) = &mut self.renderer else { return };
-                if let Some(frame) = self.slot.lock().unwrap().take() {
-                    r.upload(&frame);
-                }
+                let timing = match self.slot.lock().unwrap().take() {
+                    Some(frame) => {
+                        r.upload(&frame);
+                        frame.timing
+                    }
+                    None => None,
+                };
                 // Redimensionnement à la souris proportionnel à l'image (si « garder le ratio »).
                 let aspect = r.video_size().map(|(w, h)| w as f64 / h.max(1) as f64);
                 win::set_resize_aspect(aspect.filter(|_| self.cfg.keep_aspect));
                 r.render(self.cfg.keep_aspect, self.control || self.debug_border);
+                // Latence : de la capture sur la source à l'affichage ici.
+                if let (Some(t), Some(offset)) = (timing, self.clock.lock().unwrap().offset()) {
+                    self.latency.record(&t, latency::now_us(), offset);
+                }
                 // Le ratio de la vidéo est maintenant connu : on recale la disposition PiP.
                 if !self.layout_applied && r.video_size().is_some() {
                     self.layout_applied = true;

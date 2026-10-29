@@ -29,6 +29,7 @@ Dans la fenêtre PiP (Alt = touche d'interaction, curseur sur la fenêtre) :
   - Alt+1 / Alt+2 / Alt+3 -> coin (PiP) / moitié gauche / moitié droite (PbP)
   - Alt+A                 -> étirement libre
   - Alt+haut / Alt+bas    -> opacité au survol
+  - Alt+L                 -> compteur de latence (temps entre l'autre écran et le vôtre)
   - Alt+Q                 -> fermer la fenêtre
   - Ctrl+Alt+K            -> prendre / rendre la main sur l'autre PC (partout)
 

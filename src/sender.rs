@@ -16,9 +16,10 @@ use openh264::encoder::{
 use crate::capture::{Capturer, FrameStatus};
 use crate::config::SendConfig;
 use crate::discovery;
+use crate::latency;
 use crate::protocol::{
-    self, IN_KEY, IN_MOUSE_BUTTON, IN_MOUSE_MOVE, IN_WHEEL, MAGIC, MSG_AUTH, MSG_HELLO, MSG_REPLACED, MSG_VIDEO,
-    REQ_AUTH, REQ_KEYFRAME,
+    self, IN_KEY, IN_MOUSE_BUTTON, IN_MOUSE_MOVE, IN_WHEEL, MAGIC, MSG_AUTH, MSG_HELLO, MSG_PONG, MSG_REPLACED,
+    MSG_VIDEO, REQ_AUTH, REQ_KEYFRAME, REQ_PING,
 };
 use crate::win::{self, Injector};
 use crate::yuv::I420;
@@ -115,7 +116,9 @@ fn stream_to(
         let alive = alive.clone();
         let writer = writer.clone();
         std::thread::spawn(move || {
-            for packet in rx {
+            for mut packet in rx {
+                // Instant d'envoi : au dernier moment, après l'attente éventuelle dans la file.
+                packet[8..16].copy_from_slice(&latency::now_us().to_le_bytes());
                 let r = protocol::write_packet(&mut *writer.lock().unwrap(), MSG_VIDEO, &packet);
                 in_flight.fetch_sub(1, Ordering::Relaxed);
                 if r.is_err() {
@@ -157,6 +160,12 @@ fn stream_to(
                 let mut count = |slot: usize, ok: bool| if ok { applied[slot] += 1 } else { refused += 1 };
                 match kind {
                     REQ_KEYFRAME => keyframe_requested.store(true, Ordering::Relaxed),
+                    // Synchronisation des horloges pour la mesure de latence du viewer.
+                    REQ_PING if p.len() == 8 => {
+                        let mut pong = p.clone();
+                        pong.extend_from_slice(&latency::now_us().to_le_bytes());
+                        let _ = protocol::write_packet(&mut *writer.lock().unwrap(), MSG_PONG, &pong);
+                    }
                     REQ_AUTH => {
                         authed = allow && protocol::check_auth(&code, &nonce, &p);
                         let _ = protocol::write_packet(&mut *writer.lock().unwrap(), MSG_AUTH, &[u8::from(authed)]);
@@ -193,6 +202,8 @@ fn stream_to(
     let start = Instant::now();
     let mut next_allowed = Instant::now();
     let mut dirty = true;
+    // Instant de capture de l'image en attente (horloge `latency`).
+    let mut captured_at = latency::now_us();
     let mut yuv = I420::new();
     let mut stats = Stats::new();
 
@@ -206,6 +217,7 @@ fn stream_to(
         let wait = if dirty { next_allowed.saturating_duration_since(Instant::now()) } else { interval };
         if let FrameStatus::Updated = capturer.next_frame(wait.as_millis().max(1) as u32)? {
             dirty = true;
+            captured_at = latency::now_us();
         }
         let force_key = keyframe_requested.load(Ordering::Relaxed);
         if !(dirty || force_key) || Instant::now() < next_allowed {
@@ -222,12 +234,16 @@ fn stream_to(
             encoder.force_intra_frame();
         }
         let ts = openh264::Timestamp::from_millis(start.elapsed().as_millis() as u64);
-        let packet = encoder.encode_at(&yuv, ts)?.to_vec();
+        // En-tête de latence : instant de capture, puis instant d'envoi (rempli à l'envoi).
+        let mut packet = Vec::with_capacity(latency::VIDEO_HEADER + 64 * 1024);
+        packet.extend_from_slice(&captured_at.to_le_bytes());
+        packet.extend_from_slice(&[0u8; 8]);
+        encoder.encode_at(&yuv, ts)?.write_vec(&mut packet);
         stats.encode_ms += t0.elapsed().as_secs_f64() * 1000.0;
 
         dirty = false;
         next_allowed = t0 + interval;
-        if packet.is_empty() {
+        if packet.len() == latency::VIDEO_HEADER {
             continue;
         }
         stats.frames += 1;

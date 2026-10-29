@@ -13,6 +13,8 @@ pub struct Frame {
     pub y: Vec<u8>,
     pub u: Vec<u8>,
     pub v: Vec<u8>,
+    /// Horodatage pour la mesure de latence.
+    pub timing: Option<crate::latency::FrameTiming>,
 }
 
 /// Épaisseur du liseré du mode contrôle, en pixels.
